@@ -1,0 +1,63 @@
+model: Qwen3-30B-A3B
+parallel:
+  tp_size: 1
+  ep_size: 1
+  pp_size: 1
+
+# ---------------------------------------------------------------------------
+# Gateway: stateless FastAPI ingress.
+# ---------------------------------------------------------------------------
+gateway:
+  replicas: 2
+  image:
+    repository: ghcr.io/sparksnail/prism-serve
+    tag: ""            # defaults to .Chart.AppVersion
+    pullPolicy: IfNotPresent
+  port: 8080
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  service:
+    type: ClusterIP
+    port: 80
+
+# ---------------------------------------------------------------------------
+# Worker: prism-infer engine instances (GPU, stateful).
+# ---------------------------------------------------------------------------
+worker:
+  replicas: 1
+  image:
+    repository: ghcr.io/sparksnail/prism-infer
+    tag: "latest"
+    pullPolicy: IfNotPresent
+  port: 8000
+  gpu:
+    count: 1
+    type: a100-80g     # maps to a nodeSelector label
+  resources:
+    requests:
+      cpu: "4"
+      memory: 32Gi
+    limits:
+      cpu: "8"
+      memory: 64Gi
+  # KV cache scratch volume (per-replica, via volumeClaimTemplates).
+  storage:
+    size: 50Gi
+    storageClassName: ""
+
+# ---------------------------------------------------------------------------
+# Backing services.
+# ---------------------------------------------------------------------------
+redis:
+  url: redis://redis:6379/0
+nats:
+  url: nats://nats:4222
+
+imagePullSecrets: []
+nodeSelector: {}
+tolerations: []

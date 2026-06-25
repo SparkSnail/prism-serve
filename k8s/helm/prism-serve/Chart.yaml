@@ -1,0 +1,17 @@
+apiVersion: v2
+name: prism-serve
+description: Kubernetes control plane for disaggregated LLM serving
+type: application
+version: 0.0.1
+appVersion: "0.0.1"
+home: https://github.com/SparkSnail/prism-serve
+sources:
+  - https://github.com/SparkSnail/prism-serve
+maintainers:
+  - name: SparkSnail
+keywords:
+  - llm
+  - inference
+  - serving
+  - kubernetes
+  - disaggregated

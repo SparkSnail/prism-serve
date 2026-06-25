@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "prism-serve.fullname" . }}-worker
+  labels:
+    {{- include "prism-serve.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  serviceName: {{ include "prism-serve.fullname" . }}-worker
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      {{- include "prism-serve.worker.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "prism-serve.worker.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      nodeSelector:
+        nvidia.com/gpu.product: {{ .Values.worker.gpu.type | quote }}
+        {{- with .Values.nodeSelector }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: worker
+          image: {{ include "prism-serve.worker.image" . }}
+          imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
+          ports:
+            - name: rpc
+              containerPort: {{ .Values.worker.port }}
+          env:
+            - name: PRISM_MODEL
+              value: {{ .Values.model | quote }}
+            - name: PRISM_TP_SIZE
+              value: {{ .Values.parallel.tp_size | quote }}
+          resources:
+            requests:
+              cpu: {{ .Values.worker.resources.requests.cpu | quote }}
+              memory: {{ .Values.worker.resources.requests.memory | quote }}
+              nvidia.com/gpu: {{ .Values.worker.gpu.count }}
+            limits:
+              cpu: {{ .Values.worker.resources.limits.cpu | quote }}
+              memory: {{ .Values.worker.resources.limits.memory | quote }}
+              nvidia.com/gpu: {{ .Values.worker.gpu.count }}
+          volumeMounts:
+            - name: kv-scratch
+              mountPath: /var/lib/prism/kv
+  volumeClaimTemplates:
+    - metadata:
+        name: kv-scratch
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.worker.storage.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.worker.storage.size }}
