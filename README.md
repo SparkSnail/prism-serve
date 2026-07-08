@@ -8,16 +8,31 @@
   <a href="#features"><b>Features</b></a> ·
   <a href="#installation"><b>Installation</b></a> ·
   <a href="#quick-start"><b>Quick Start</b></a> ·
+  <a href="#testing"><b>Testing</b></a> ·
   <a href="#deployment"><b>Deployment</b></a>
 </p>
 
-**prism-serve** is a control plane that turns single-instance LLM inference engines into a fault-tolerant, elastic cluster service on Kubernetes: KV-affinity routing, predictive autoscaling, stateful rescale, and cluster-level prefill/decode (PD) scheduling.
+<p align="center">
+  <a href="https://github.com/SparkSnail/prism-serve/actions/workflows/ci.yml">
+    <img src="https://github.com/SparkSnail/prism-serve/actions/workflows/ci.yml/badge.svg" alt="CI"/>
+  </a>
+</p>
+
+**prism-serve** is a control plane that turns single-instance LLM inference engines into a
+fault-tolerant, elastic cluster service on Kubernetes: cluster-level prefill/decode (PD)
+scheduling, KV transfer flow control, recompute fallback, and a 10 ms reconcile loop modelled
+on Ray Serve.
 
 ## Features
 
-- [x] **`prism_serve` package skeleton**: gateway / scheduler / router / engine / metrics
-- [x] **FastAPI gateway** with `/healthz` and `/readyz` probes and an OpenAI-compatible route stub
-- [x] **Helm chart skeleton**: gateway Deployment + Service, worker StatefulSet
+- [x] **FastAPI gateway**: liveness/readiness probes, OpenAI-compatible route stub, infer instance registration
+- [x] **PD scheduler**: shortest-queue prefill selection, most-free-slots decode selection, runtime instance-count recommendation
+- [x] **KV transfer flow control**: dynamic high/low watermark, per-dst byte cap, FIFO deferred queue with automatic flush
+- [x] **Recompute fallback**: timeout detection, `reset_to_waiting` on D instance, abort after max attempts
+- [x] **Request state machine**: per-request `SeqState` lifecycle, illegal-transition guard, stuck-request detection, TTFT timestamps
+- [x] **10 ms schedule loop**: Phase 1-6 reconcile — assign P/D, submit KV, stuck check, deferred flush, collect finished, metrics
+- [x] **NATS queue**: publish/subscribe wrapper, inbox buffer, `queue_group` exactly-once delivery, wildcard `kv_usage.*` subscription
+- [x] **Metrics**: Prometheus counters/gauges/histograms for TTFT, KV transfer, congestion, deferred depth, slot utilisation
 
 ## Installation
 
@@ -34,7 +49,7 @@ pip install -e .
 Start the gateway:
 
 ```bash
-prism-serve            # serves the FastAPI gateway on :8080
+prism-serve            # FastAPI gateway on :8080
 # or: uvicorn prism_serve.gateway.app:app --host 0.0.0.0 --port 8080
 ```
 
@@ -45,7 +60,26 @@ curl localhost:8080/healthz   # {"status":"ok","version":"0.0.1"}
 curl localhost:8080/readyz    # {"status":"ready"}
 ```
 
-Configuration is read from environment variables (prefix `PRISM_SERVE_`), e.g. `PRISM_SERVE_PORT=9090 prism-serve`.
+Register an infer instance once it is up:
+
+```bash
+curl -X POST localhost:8080/internal/register_instance \
+  -H "Content-Type: application/json" \
+  -d '{"instance_id":"p-0","role":"prefill"}'
+
+curl -X POST localhost:8080/internal/register_instance \
+  -H "Content-Type: application/json" \
+  -d '{"instance_id":"d-0","role":"decode","max_slots":127}'
+```
+
+
+## Test
+
+```bash
+pip install -e ".[test]"
+python -m pytest tests/ -q
+```
+
 
 ## Deployment
 
@@ -57,4 +91,4 @@ helm install prism-serve k8s/helm/prism-serve -n prism --create-namespace
 
 ## License
 
-Apache-2.0, see [LICENSE](LICENSE).
+[Apache-2.0](LICENSE)
