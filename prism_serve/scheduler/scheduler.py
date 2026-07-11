@@ -13,12 +13,24 @@ Borrowing:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+import secrets
+import time
+from dataclasses import dataclass
 
 
-# ---------------------------------------------------------------------------
-# PDScheduler
-# ---------------------------------------------------------------------------
+@dataclass(slots=True, frozen=True)
+class QuarantineRecord:
+    instance_id: str
+    instance_epoch: str
+    role: str
+    reconciliation_token: str
+    quarantined_at: float
+
+
+class QuarantinedInstanceError(ValueError):
+    def __init__(self, record: QuarantineRecord) -> None:
+        super().__init__(f"instance {record.instance_id!r} is quarantined")
+        self.record = record
 
 class PDScheduler:
     """Cluster-level PD orchestration decision maker.
@@ -43,16 +55,19 @@ class PDScheduler:
         self._decode_free_slots: dict[str, int] = {}
         # instance_id → KV usage ratio 0.0–1.0 (updated by metrics collector)
         self._kv_usage: dict[str, float] = {}
+        self._instance_epochs: dict[str, str] = {}
+        self._instance_roles: dict[str, str] = {}
+        self._quarantined: dict[str, QuarantineRecord] = {}
 
-    # ------------------------------------------------------------------
     # Registration
-    # ------------------------------------------------------------------
 
     def register_instance(
         self,
         instance_id: str,
         role: str,
         max_slots: int = 0,
+        instance_epoch: str = "",
+        active_request_ids: list[str] | None = None,
     ) -> None:
         """Register a new instance when a K8S Pod comes up.
 
@@ -61,6 +76,22 @@ class PDScheduler:
             role:        "prefill" | "decode"
             max_slots:   decode instances must supply this (> 0)
         """
+        if instance_id in self._quarantined:
+            raise QuarantinedInstanceError(self._quarantined[instance_id])
+        if active_request_ids:
+            raise ValueError(
+                f"instance still owns active requests: {active_request_ids!r}"
+            )
+        epoch = instance_epoch or f"legacy:{instance_id}"
+        existing_epoch = self._instance_epochs.get(instance_id)
+        if existing_epoch is not None:
+            if existing_epoch != epoch:
+                raise ValueError(
+                    "instance epoch changed without reconciliation: "
+                    f"{instance_id=} {existing_epoch=} {epoch=}"
+                )
+            return
+
         if role == "prefill":
             self._prefill_load[instance_id] = 0
         elif role == "decode":
@@ -71,16 +102,81 @@ class PDScheduler:
             self._kv_usage[instance_id] = 0.0
         else:
             raise ValueError(f"unknown role {role!r}; expected 'prefill' or 'decode'")
+        self._instance_epochs[instance_id] = epoch
+        self._instance_roles[instance_id] = role
 
     def deregister_instance(self, instance_id: str) -> None:
         """Remove an instance that is going offline."""
         self._prefill_load.pop(instance_id, None)
         self._decode_free_slots.pop(instance_id, None)
         self._kv_usage.pop(instance_id, None)
+        self._instance_epochs.pop(instance_id, None)
+        self._instance_roles.pop(instance_id, None)
 
-    # ------------------------------------------------------------------
+    def quarantine_instance(self, instance_id: str) -> QuarantineRecord:
+        """Remove untrusted capacity until the instance reconciles its epoch."""
+        existing = self._quarantined.get(instance_id)
+        if existing is not None:
+            return existing
+        record = QuarantineRecord(
+            instance_id=instance_id,
+            instance_epoch=self._instance_epochs.get(instance_id, "unknown"),
+            role=self._instance_roles.get(instance_id, "unknown"),
+            reconciliation_token=secrets.token_urlsafe(24),
+            quarantined_at=time.monotonic(),
+        )
+        self._prefill_load.pop(instance_id, None)
+        self._decode_free_slots.pop(instance_id, None)
+        self._kv_usage.pop(instance_id, None)
+        self._quarantined[instance_id] = record
+        return record
+
+    def reconcile_instance(
+        self,
+        instance_id: str,
+        instance_epoch: str,
+        reconciliation_token: str,
+        role: str,
+        max_slots: int,
+        active_request_ids: list[str],
+    ) -> None:
+        """Restore quarantined capacity after the instance reports no requests."""
+        record = self._quarantined.get(instance_id)
+        if record is None:
+            raise ValueError(f"instance {instance_id!r} is not quarantined")
+        if reconciliation_token != record.reconciliation_token:
+            raise ValueError("reconciliation token does not match")
+        if active_request_ids:
+            raise ValueError(
+                f"instance still owns active requests: {active_request_ids!r}"
+            )
+        if not instance_epoch:
+            raise ValueError("instance_epoch must not be empty")
+        if role not in {"prefill", "decode"}:
+            raise ValueError(f"unknown role {role!r}")
+        if record.role != "unknown" and role != record.role:
+            raise ValueError(
+                f"reconciliation role changed: expected={record.role!r}, got={role!r}"
+            )
+        if role == "decode" and max_slots <= 0:
+            raise ValueError(
+                f"decode instance must specify max_slots > 0, got {max_slots=}"
+            )
+
+        # No validation or other fallible work may follow quarantine removal.
+        if role == "prefill":
+            self._prefill_load[instance_id] = 0
+        else:
+            self._decode_free_slots[instance_id] = max_slots
+            self._kv_usage[instance_id] = 0.0
+        self._instance_epochs[instance_id] = instance_epoch
+        self._instance_roles[instance_id] = role
+        self._quarantined.pop(instance_id)
+
+    def quarantine_record(self, instance_id: str) -> QuarantineRecord | None:
+        return self._quarantined.get(instance_id)
+
     # Selection
-    # ------------------------------------------------------------------
 
     def pick_prefill_instance(self, req_id: str) -> str | None:
         """Select the P instance with the shortest queue (least loaded).
@@ -126,9 +222,7 @@ class PDScheduler:
         self._decode_free_slots[best] -= 1
         return best
 
-    # ------------------------------------------------------------------
     # Feedback from infer layer
-    # ------------------------------------------------------------------
 
     def on_prefill_done(self, instance_id: str) -> None:
         """Decrement P instance queue depth when prefill completes."""
@@ -146,9 +240,7 @@ class PDScheduler:
         """Update KV usage for a D instance (called by metrics collector)."""
         self._kv_usage[instance_id] = max(0.0, min(1.0, ratio))
 
-    # ------------------------------------------------------------------
     # Adaptive decode instance count
-    # ------------------------------------------------------------------
 
     def decide_decode_instance_count(self, active_kv_bytes: int) -> int:
         """Compute recommended number of decode instances at runtime.
@@ -173,9 +265,7 @@ class PDScheduler:
             min(n, self.config.get("max_decode_instances", 64)),
         )
 
-    # ------------------------------------------------------------------
     # Introspection (for tests / monitoring)
-    # ------------------------------------------------------------------
 
     def prefill_queue_depths(self) -> dict[str, int]:
         return dict(self._prefill_load)

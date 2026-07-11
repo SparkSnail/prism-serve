@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
@@ -20,6 +22,10 @@ class Settings(BaseSettings):
     nats_url:  str = "nats://localhost:4222"
     nats_connect_timeout_s: float = 2.0
     nats_max_reconnect_attempts: int = 60
+    gateway_pod_uid: str = ""
+    gateway_process_generation: str = str(uuid.uuid4())
+    # Slot and quarantine state is process-local until leader failover is added.
+    control_plane_replica_count: int = 1
     # Production fails closed; local gateway-only runs must opt into mock mode.
     nats_required: bool = True
 

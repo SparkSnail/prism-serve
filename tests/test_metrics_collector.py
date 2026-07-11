@@ -233,25 +233,28 @@ async def test_scrape_kv_usage_client_exception_is_swallowed():
 @pytest.mark.asyncio
 async def test_tick_loop_calls_scrape():
     mc = _make_collector_with_mock_prometheus()
-    mc._kv_usage_scrape_interval_s = 0.001   # 1 ms for test speed
+    mc._kv_usage_scrape_interval_s = 0.001
 
     call_count = 0
+    scraped_twice = asyncio.Event()
 
     async def fake_scrape():
         nonlocal call_count
         call_count += 1
+        if call_count >= 2:
+            scraped_twice.set()
 
     mc._scrape_kv_usage = fake_scrape
 
     task = asyncio.create_task(mc.tick_loop())
-    await asyncio.sleep(0.015)
+    await asyncio.wait_for(scraped_twice.wait(), timeout=0.5)
     task.cancel()
     try:
         await task
     except asyncio.CancelledError:
         pass
 
-    assert call_count >= 2, f"expected ≥2 scrape calls, got {call_count}"
+    assert call_count >= 2, f"expected at least 2 scrape calls, got {call_count}"
 
 
 @pytest.mark.asyncio

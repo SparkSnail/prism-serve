@@ -219,6 +219,10 @@ class RequestTracker:
         """Iterate over all requests in a given state."""
         return (r for r in self._requests.values() if r.state == state)
 
+    def all_requests(self) -> list[RequestInfo]:
+        """Return a stable snapshot for shutdown cleanup."""
+        return list(self._requests.values())
+
     def __len__(self) -> int:
         return len(self._requests)
 

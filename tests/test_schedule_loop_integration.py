@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from prism_serve.metrics.collector import NullMetrics
-from prism_serve.scheduler.main_loop import schedule_loop
+from prism_serve.scheduler.main_loop import _abort_remote_request, schedule_loop
 from prism_serve.scheduler.queue import NATSQueue
 from prism_serve.scheduler.scheduler import PDScheduler
 from prism_serve.scheduler.sequence_state import RequestInfo, RequestTracker, SeqState
@@ -41,7 +41,7 @@ def make_components(config: dict | None = None):
         lambda src, dst, req_id, on_complete=None: on_complete() if on_complete else None
     )
     infer_client.reset_to_waiting = MagicMock()
-    infer_client.abort_request.return_value = {"success": True}
+    infer_client.abort_request = AsyncMock(return_value={"success": True})
 
     governor = TransferGovernor(cfg, infer_client, metrics)
     scheduler = PDScheduler(cfg)
@@ -692,6 +692,27 @@ def test_governor_kv_usage_update_unblocks_deferred():
 
     assert governor.deferred_depth("d-0") == 0
     infer_client.transfer.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_sync_abort_client_is_bounded_by_timeout():
+    """A blocking synchronous RPC must not stall the event loop."""
+    import time as wall_time
+
+    client = MagicMock()
+
+    def blocking_abort(**_kwargs):
+        wall_time.sleep(0.1)
+        return {"success": True}
+
+    client.abort_request.side_effect = blocking_abort
+    started = wall_time.monotonic()
+    acknowledged = await _abort_remote_request(
+        client, "d-0", "owner-uid", "R1", timeout_s=0.01
+    )
+
+    assert acknowledged is False
+    assert wall_time.monotonic() - started < 0.08
 
 
 @pytest.mark.asyncio

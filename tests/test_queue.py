@@ -12,7 +12,11 @@ from prism_serve.scheduler.queue import NATSQueue
 
 def make_queue() -> NATSQueue:
     return NATSQueue(
-        {"nats_url": "nats://localhost:4222", "scheduler_id": "serve-0"},
+        {
+            "nats_url": "nats://localhost:4222",
+            "scheduler_id": "serve-0",
+            "scheduler_generation": "boot-1",
+        },
         use_mock=True,
     )
 
@@ -43,19 +47,31 @@ async def test_publish_mock_does_not_raise():
 def test_subjects_are_scoped_to_target_and_owner():
     q = make_queue()
     assert q.dispatch_subject("p-0") == "dispatch_prefill.p-0"
-    assert q.reply_subject("prefill_done") == "prefill_done.serve-0"
-    assert q.reply_subject("decode_done") == "decode_done.serve-0"
+    assert q.reply_subject("prefill_done") == "prefill_done.serve-0--boot-1"
+    assert q.reply_subject("decode_done") == "decode_done.serve-0--boot-1"
 
 
 @pytest.mark.parametrize("bad_id", ["", "serve.0", "serve *", "serve>"])
 def test_subject_scope_rejects_wildcard_or_multitoken_ids(bad_id):
-    with pytest.raises(AssertionError):
+    with pytest.raises((AssertionError, ValueError)):
         NATSQueue({"scheduler_id": bad_id}, use_mock=True)
+
+
+def test_process_restart_changes_owner_for_same_pod_uid():
+    first = NATSQueue({
+        "scheduler_id": "pod-uid", "scheduler_generation": "boot-1",
+    }, use_mock=True)
+    second = NATSQueue({
+        "scheduler_id": "pod-uid", "scheduler_generation": "boot-2",
+    }, use_mock=True)
+    assert first.owner_id != second.owner_id
 
 
 @pytest.mark.asyncio
 async def test_publish_fails_when_real_connection_is_unavailable():
-    q = NATSQueue({"scheduler_id": "serve-0"})
+    q = NATSQueue({
+        "scheduler_id": "serve-0", "scheduler_generation": "boot-1",
+    })
     with pytest.raises(ConnectionError, match="NATS unavailable"):
         await q.publish("dispatch_prefill.p-0", {"req_id": "R1"})
 

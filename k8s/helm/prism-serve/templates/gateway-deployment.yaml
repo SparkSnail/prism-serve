@@ -34,6 +34,12 @@ spec:
               value: {{ .Values.redis.url | quote }}
             - name: PRISM_SERVE_NATS_URL
               value: {{ .Values.nats.url | quote }}
+            - name: PRISM_SERVE_GATEWAY_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: PRISM_SERVE_CONTROL_PLANE_REPLICA_COUNT
+              value: {{ .Values.gateway.replicas | quote }}
           livenessProbe:
             httpGet:
               path: /healthz

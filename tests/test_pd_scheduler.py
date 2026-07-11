@@ -15,9 +15,7 @@ def make_scheduler(extra: dict | None = None) -> PDScheduler:
     return PDScheduler(config)
 
 
-# ---------------------------------------------------------------------------
 # register_instance
-# ---------------------------------------------------------------------------
 
 def test_register_prefill():
     sch = make_scheduler()
@@ -56,9 +54,32 @@ def test_deregister():
     assert "d-0" not in sch._decode_free_slots
 
 
-# ---------------------------------------------------------------------------
+def test_quarantine_cannot_be_bypassed_by_registration():
+    sch = make_scheduler()
+    sch.register_instance("d-0", "decode", max_slots=2, instance_epoch="e1")
+    record = sch.quarantine_instance("d-0")
+
+    with pytest.raises(ValueError, match="quarantined"):
+        sch.register_instance("d-0", "decode", max_slots=2, instance_epoch="e1")
+
+    with pytest.raises(ValueError, match="token"):
+        sch.reconcile_instance("d-0", "e2", "wrong", "decode", 2, [])
+    assert sch.quarantine_record("d-0") is record
+
+    with pytest.raises(ValueError, match="max_slots"):
+        sch.reconcile_instance(
+            "d-0", "e2", record.reconciliation_token, "decode", 0, []
+        )
+    assert sch.quarantine_record("d-0") is record
+
+    sch.reconcile_instance(
+        "d-0", "e2", record.reconciliation_token, "decode", 2, []
+    )
+    assert sch.decode_free_slots()["d-0"] == 2
+    assert sch.quarantine_record("d-0") is None
+
+
 # pick_prefill_instance
-# ---------------------------------------------------------------------------
 
 def test_pick_prefill_shortest_queue():
     sch = make_scheduler()
@@ -82,9 +103,7 @@ def test_pick_prefill_none_when_empty():
     assert sch.pick_prefill_instance("req-1") is None
 
 
-# ---------------------------------------------------------------------------
 # pick_decode_instance
-# ---------------------------------------------------------------------------
 
 def test_pick_decode_most_slots():
     sch = make_scheduler()
@@ -129,9 +148,7 @@ def test_pick_decode_all_congested_returns_none():
     assert result is None
 
 
-# ---------------------------------------------------------------------------
 # Feedback callbacks
-# ---------------------------------------------------------------------------
 
 def test_on_prefill_done_decrements():
     sch = make_scheduler()
@@ -166,9 +183,7 @@ def test_update_kv_usage_clamps():
     assert sch._kv_usage["d-0"] == 0.0
 
 
-# ---------------------------------------------------------------------------
 # decide_decode_instance_count (← Flink AdaptiveBatch)
-# ---------------------------------------------------------------------------
 
 def test_decide_count_flink_formula_low():
     sch = make_scheduler({

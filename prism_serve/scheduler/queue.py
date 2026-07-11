@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -19,11 +18,16 @@ class NATSQueue:
             "nats_max_reconnect_attempts", 60
         )
         configured_owner = config.get("scheduler_id")
-        self._owner_id = (
-            os.getenv("HOSTNAME", "serve-local")
-            if configured_owner is None
-            else configured_owner
-        )
+        configured_generation = config.get("scheduler_generation")
+        if not use_mock and config.get("nats_required", True) and not configured_owner:
+            raise ValueError("scheduler_id must be injected from Kubernetes metadata.uid")
+        if not use_mock and config.get("nats_required", True) and not configured_generation:
+            raise ValueError("scheduler_generation must identify this process start")
+        pod_uid = "serve-local" if configured_owner is None else configured_owner
+        generation = configured_generation or "test-generation"
+        _validate_subject_token(pod_uid, "scheduler_id")
+        _validate_subject_token(generation, "scheduler_generation")
+        self._owner_id = f"{pod_uid}--{generation}"
         _validate_subject_token(self._owner_id, "scheduler_id")
         self._use_mock = use_mock
         self._nc = None

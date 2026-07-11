@@ -26,6 +26,10 @@ async def lifespan(app: FastAPI):
     from prism_serve.scheduler.queue import NATSQueue
 
     config = _build_config()
+    if config["control_plane_replica_count"] != 1:
+        raise RuntimeError(
+            "process-local control-plane state requires one active gateway"
+        )
 
     # Start metrics before components that report through it.
     try:
@@ -77,6 +81,7 @@ async def lifespan(app: FastAPI):
         )
     )
     app.state.loop_task = loop_task
+    app.state.control_plane_failed = False
     loop_task.add_done_callback(lambda task: _on_schedule_loop_done(app, task))
 
     app.state.accepting = True
@@ -89,7 +94,7 @@ async def lifespan(app: FastAPI):
     app.state.accepting = False
 
     # Keep scheduling while existing requests and transfer ledgers drain.
-    await _wait_for_control_plane_drain(
+    drained = await _wait_for_control_plane_drain(
         app.state.tracker,
         app.state.governor,
         timeout_s=config["shutdown_drain_timeout_s"],
@@ -99,6 +104,15 @@ async def lifespan(app: FastAPI):
         await asyncio.wait_for(asyncio.shield(loop_task), timeout=60.0)
     except (asyncio.CancelledError, asyncio.TimeoutError):
         pass
+
+    if not drained:
+        await _abort_remaining_requests(
+            app.state.tracker,
+            app.state.scheduler,
+            app.state.governor,
+            app.state.queue.owner_id,
+            timeout_s=config["abort_request_timeout_s"],
+        )
 
     await _drain_governor(app.state.governor, timeout_s=30.0)
 
@@ -118,9 +132,13 @@ app = FastAPI(
 
 
 @app.get("/healthz")
-def healthz() -> dict:
-    """Report process liveness."""
-    return {"status": "ok", "version": __version__}
+def healthz(request: Request) -> JSONResponse:
+    """Fail liveness after an unexpected scheduler exit."""
+    if getattr(request.app.state, "control_plane_failed", False):
+        return JSONResponse(
+            {"status": "failed", "version": __version__}, status_code=503
+        )
+    return JSONResponse({"status": "ok", "version": __version__})
 
 
 @app.get("/readyz")
@@ -176,10 +194,49 @@ async def register_instance(request: Request) -> JSONResponse:
             instance_id=body["instance_id"],
             role=body["role"],
             max_slots=body.get("max_slots", 0),
+            instance_epoch=body["instance_epoch"],
+            active_request_ids=body["active_request_ids"],
+        )
+    except KeyError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        from prism_serve.scheduler.scheduler import QuarantinedInstanceError
+        if isinstance(exc, QuarantinedInstanceError):
+            record = exc.record
+            return JSONResponse(
+                {
+                    "error": "instance_quarantined",
+                    "instance_id": record.instance_id,
+                    "instance_epoch": record.instance_epoch,
+                    "reconciliation_token": record.reconciliation_token,
+                },
+                status_code=409,
+            )
+        if not isinstance(exc, (AssertionError, ValueError)):
+            raise
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse({"status": "registered", "instance_id": body["instance_id"]})
+
+
+@app.post("/internal/reconcile_instance")
+async def reconcile_instance(request: Request) -> JSONResponse:
+    """Restore quarantined capacity after validating the remote request set."""
+    body = await request.json()
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if scheduler is None:
+        return JSONResponse({"error": "scheduler not ready"}, status_code=503)
+    try:
+        scheduler.reconcile_instance(
+            instance_id=body["instance_id"],
+            instance_epoch=body["instance_epoch"],
+            reconciliation_token=body["reconciliation_token"],
+            role=body["role"],
+            max_slots=body.get("max_slots", 0),
+            active_request_ids=body["active_request_ids"],
         )
     except (KeyError, AssertionError, ValueError) as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
-    return JSONResponse({"status": "registered", "instance_id": body["instance_id"]})
+    return JSONResponse({"status": "reconciled", "instance_id": body["instance_id"]})
 
 
 def _build_config() -> dict:
@@ -189,6 +246,9 @@ def _build_config() -> dict:
         "nats_connect_timeout_s":   settings.nats_connect_timeout_s,
         "nats_max_reconnect_attempts": settings.nats_max_reconnect_attempts,
         "nats_required":            settings.nats_required,
+        "scheduler_id":             settings.gateway_pod_uid,
+        "scheduler_generation":     settings.gateway_process_generation,
+        "control_plane_replica_count": settings.control_plane_replica_count,
         "HIGH_WATERMARK":           settings.high_watermark,
         "LOW_WATERMARK":            settings.low_watermark,
         "MAX_BYTES_INFLIGHT":       settings.max_bytes_inflight,
@@ -258,12 +318,37 @@ def _on_schedule_loop_done(app: FastAPI, task: asyncio.Task) -> None:
     if task.cancelled():
         return
     app.state.accepting = False
+    app.state.control_plane_failed = True
     error = task.exception()
     if error is not None:
         logger.error(
             "schedule_loop stopped; readiness disabled",
             exc_info=(type(error), error, error.__traceback__),
         )
+
+
+async def _abort_remaining_requests(
+    tracker,
+    scheduler,
+    governor,
+    owner_id: str,
+    timeout_s: float,
+) -> None:
+    """Abort requests left after graceful drain before closing NATS."""
+    from prism_serve.scheduler.main_loop import _abort_and_release
+    from prism_serve.scheduler.sequence_state import SeqState
+
+    for req in tracker.all_requests():
+        await _abort_and_release(
+            req,
+            scheduler,
+            governor,
+            owner_id,
+            timeout_s,
+            include_prefill=req.state in {SeqState.PREFILLING, SeqState.KV_PENDING},
+        )
+        tracker.transition(req.req_id, SeqState.ABORTED)
+        tracker.remove(req.req_id)
 
 
 def main() -> None:

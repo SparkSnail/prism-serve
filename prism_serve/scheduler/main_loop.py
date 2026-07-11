@@ -260,8 +260,8 @@ async def _abort_and_release(
             governor.infer_client, instance_id, owner_id, req.req_id, timeout_s
         )
         if not acknowledged:
-            # Registration must rebuild capacity that may still be held remotely.
-            scheduler.deregister_instance(instance_id)
+            # Remote capacity remains unsafe until an explicit reconciliation.
+            scheduler.quarantine_instance(instance_id)
             continue
         if role == "prefill":
             scheduler.on_prefill_done(instance_id)
@@ -279,13 +279,22 @@ async def _abort_remote_request(
 ) -> bool:
     """Call the idempotent abort RPC and normalize sync and async clients."""
     try:
-        result = infer_client.abort_request(
-            instance_id=instance_id,
-            owner_id=owner_id,
-            req_id=req_id,
-        )
-        if inspect.isawaitable(result):
-            result = await asyncio.wait_for(result, timeout=timeout_s)
+        method = infer_client.abort_request
+
+        async def invoke():
+            kwargs = {
+                "instance_id": instance_id,
+                "owner_id": owner_id,
+                "req_id": req_id,
+            }
+            if inspect.iscoroutinefunction(method):
+                return await method(**kwargs)
+            result = await asyncio.to_thread(method, **kwargs)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+
+        result = await asyncio.wait_for(invoke(), timeout=timeout_s)
         if isinstance(result, dict):
             return bool(result.get("success"))
         return bool(result)
@@ -295,6 +304,7 @@ async def _abort_remote_request(
             req_id, instance_id, exc,
         )
         return False
+
 
 def _on_kv_done(
     req_id: str,

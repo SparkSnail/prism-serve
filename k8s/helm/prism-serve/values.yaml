@@ -8,7 +8,8 @@ parallel:
 # Gateway: stateless FastAPI ingress.
 # ---------------------------------------------------------------------------
 gateway:
-  replicas: 2
+  # Scheduler capacity and quarantine state are process-local.
+  replicas: 1
   image:
     repository: ghcr.io/sparksnail/prism-serve
     tag: ""            # defaults to .Chart.AppVersion
