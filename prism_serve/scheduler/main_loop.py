@@ -1,27 +1,9 @@
-"""Main scheduling loop for prism-serve.
-
-A 10 ms tick-based coroutine that drives all serve-side PD orchestration.
-Phase ordering is designed so that within a single tick each request
-advances at most one state.
-
-Phase sequence:
-  1  WAITING     → PREFILLING  (assign P+D, dispatch via NATS)
-  2  PREFILLING  → KV_PENDING  (poll prefill_done, submit to governor)
-  3  stuck check → recompute / abort  (KV_PENDING timeout)
-  4  deferred flush (governor.tick)
-  5  DECODING    → FINISHED    (poll decode_done, release slots)
-  6  metrics snapshot
-
-Borrowing:
-  - 10 ms tick interval ← Ray Serve reconcile loop (empirical optimum:
-    < 1 ms spins CPU; > 100 ms delays recompute and slot release)
-  - Phase ordering ← Flink StreamTask (process new → advance in-flight
-    → clean terminal → emit metrics)
-"""
+"""Tick-based control loop for disaggregated prefill and decode."""
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from typing import TYPE_CHECKING
@@ -34,7 +16,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-TICK_INTERVAL_S: float = 0.010  # 10 ms — Ray Serve reconcile loop interval
+TICK_INTERVAL_S: float = 0.010
 
 
 async def schedule_loop(
@@ -45,26 +27,21 @@ async def schedule_loop(
     metrics,
     config: dict,
 ) -> None:
-    """Main scheduling coroutine.  Runs until cancelled.
-
-    Args:
-        scheduler: PD instance selection (PDScheduler)
-        governor:  KV transfer flow control (TransferGovernor)
-        tracker:   per-request state machine (RequestTracker)
-        queue:     NATS publish/subscribe wrapper (NATSQueue)
-        metrics:   MetricsCollector (or NullMetrics in tests)
-        config:    runtime config dict
-    """
+    """Run scheduling ticks until cancelled."""
     from prism_serve.scheduler.sequence_state import SeqState, TransferTask
 
     kv_transfer_timeout_s: float = config.get("kv_transfer_timeout_s", 30.0)
+    prefill_timeout_s: float = config.get("prefill_timeout_s", 30.0)
+    recompute_timeout_s: float = config.get("recompute_timeout_s", 30.0)
+    decode_timeout_s: float = config.get("decode_timeout_s", 300.0)
+    max_dispatch_attempts: int = config.get("max_dispatch_attempts", 3)
+    abort_timeout_s: float = config.get("abort_request_timeout_s", 5.0)
     tick_interval_s = config.get("schedule_loop_tick_ms", 10) / 1000.0
 
     while True:
         tick_start = time.monotonic()
 
-        # ── Phase 1: WAITING → PREFILLING ─────────────────────────────
-        # Assign P+D instances and dispatch prefill via NATS.
+        # Dispatch waiting requests to prefill and decode instances.
         # Stop as soon as there are no available P instances (all remaining
         # WAITING requests will be retried next tick).
         for req in list(tracker.iter_by_state(SeqState.WAITING)):
@@ -77,21 +54,69 @@ async def schedule_loop(
                 # No D slot / all D instances congested; return P load counter.
                 scheduler.on_prefill_done(p)
                 continue  # try other WAITING requests that might fit elsewhere
-            # Dispatch prefill instruction via NATS.
-            await queue.publish("dispatch_prefill", {
-                "instance_id": p,
-                "req_id":      req.req_id,
-                # token_ids are carried in the request object (set by gateway)
-            })
+            try:
+                await queue.publish(queue.dispatch_subject(p), {
+                    "instance_id": p,
+                    "req_id": req.req_id,
+                    "owner_id": queue.owner_id,
+                    "command_id": f"{queue.owner_id}:{req.req_id}",
+                    "dispatch_attempt": 1,
+                    "prefill_done_subject": queue.reply_subject("prefill_done"),
+                    "recompute_done_subject": queue.reply_subject("recompute_done"),
+                    "first_token_subject": queue.reply_subject("first_token"),
+                    "decode_done_subject": queue.reply_subject("decode_done"),
+                })
+            except Exception as exc:
+                scheduler.on_prefill_done(p)
+                scheduler.on_decode_finished(d)
+                metrics.increment(
+                    "control_message_error_total",
+                    labels={"operation": "dispatch_prefill"},
+                )
+                logger.warning("dispatch publish failed req=%s: %s", req.req_id, exc)
+                continue
             tracker.transition(
                 req.req_id, SeqState.PREFILLING,
                 prefill_instance=p,
                 decode_instance=d,
             )
 
-        # ── Phase 2: PREFILLING → KV_PENDING ──────────────────────────
-        # Poll prefill_done notifications from P instances (via NATS).
-        # For each, release P load counter and submit KV transfer to governor.
+        for req in tracker.get_stuck_prefills(prefill_timeout_s):
+            if req.dispatch_attempts >= max_dispatch_attempts:
+                await _abort_and_release(
+                    req, scheduler, governor, queue.owner_id,
+                    abort_timeout_s, include_prefill=True,
+                )
+                tracker.transition(req.req_id, SeqState.ABORTED)
+                tracker.remove(req.req_id)
+                metrics.increment(
+                    "prefill_dispatch_abort_total", labels={"reason": "timeout"}
+                )
+                continue
+            try:
+                await queue.publish(queue.dispatch_subject(req.prefill_instance), {
+                    "instance_id": req.prefill_instance,
+                    "req_id": req.req_id,
+                    "owner_id": queue.owner_id,
+                    "command_id": f"{queue.owner_id}:{req.req_id}",
+                    "dispatch_attempt": req.dispatch_attempts + 1,
+                    "prefill_done_subject": queue.reply_subject("prefill_done"),
+                    "recompute_done_subject": queue.reply_subject("recompute_done"),
+                    "first_token_subject": queue.reply_subject("first_token"),
+                    "decode_done_subject": queue.reply_subject("decode_done"),
+                })
+            except Exception as exc:
+                metrics.increment(
+                    "control_message_error_total",
+                    labels={"operation": "retry_prefill"},
+                )
+                logger.warning("retry publish failed req=%s: %s", req.req_id, exc)
+                continue
+            req.prefill_start = time.monotonic()
+            req.dispatch_attempts += 1
+            metrics.increment("prefill_dispatch_retry_total")
+
+        # Submit completed prefills for KV transfer.
         for msg in await queue.poll("prefill_done"):
             req_id = msg.get("req_id")
             if req_id is None or req_id not in tracker:
@@ -110,7 +135,6 @@ async def schedule_loop(
             )
             scheduler.on_prefill_done(req.prefill_instance)
 
-            # Submit to governor — may dispatch immediately or defer.
             governor.submit(TransferTask(
                 req_id=req_id,
                 src=req.prefill_instance,
@@ -121,9 +145,8 @@ async def schedule_loop(
                 ),
             ))
 
-        # ── Phase 3: stuck detection → recompute / abort ──────────────
-        # Scan KV_PENDING requests that have exceeded the transfer timeout.
-        # Process before Phase 4 so already-timed-out tasks are not
+        # Recover or abort timed-out work.
+        # Process before the deferred queue flush so timed-out tasks are not
         # re-flushed from the deferred queue in the same tick.
         for req in tracker.get_stuck_requests(kv_transfer_timeout_s):
             governor.cancel(req.req_id)
@@ -132,30 +155,54 @@ async def schedule_loop(
             )
             if decision == "recompute":
                 governor.trigger_recompute(req.req_id, req.decode_instance)
-                tracker.transition(req.req_id, SeqState.WAITING)
-                # Release the D slot we pre-reserved — the request will
-                # re-claim one when it enters PREFILLING again next tick.
-                scheduler.on_decode_finished(req.decode_instance)
+                tracker.transition(req.req_id, SeqState.RECOMPUTING)
                 logger.info(
                     "recompute triggered for req=%s dst=%s",
                     req.req_id, req.decode_instance,
                 )
             else:  # abort
+                await _abort_and_release(
+                    req, scheduler, governor, queue.owner_id,
+                    abort_timeout_s, include_prefill=False,
+                )
                 tracker.transition(req.req_id, SeqState.ABORTED)
-                scheduler.on_decode_finished(req.decode_instance)
                 tracker.remove(req.req_id)
                 logger.warning(
                     "request aborted (max_recompute exhausted) req=%s",
                     req.req_id,
                 )
 
-        # ── Phase 4: flush deferred transfer queue ────────────────────
-        # Let governor attempt to dispatch tasks that were deferred due to
-        # high-watermark or byte-cap congestion.
+        for msg in await queue.poll("recompute_done"):
+            req_id = msg.get("req_id")
+            req = tracker.get(req_id) if req_id is not None else None
+            if req is None or req.state != SeqState.RECOMPUTING:
+                continue
+            tracker.transition(req_id, SeqState.DECODING)
+
+        for req in tracker.get_stuck_recomputes(recompute_timeout_s):
+            decision = governor.on_transfer_failure(
+                req.req_id, req.decode_instance, "recompute_timeout"
+            )
+            if decision == "recompute":
+                governor.trigger_recompute(req.req_id, req.decode_instance)
+                req.recompute_start = time.monotonic()
+            else:
+                await _abort_and_release(
+                    req, scheduler, governor, queue.owner_id,
+                    abort_timeout_s, include_prefill=False,
+                )
+                tracker.transition(req.req_id, SeqState.ABORTED)
+                tracker.remove(req.req_id)
+
+        # Flush deferred transfers after timeout handling.
         governor.tick()
 
-        # ── Phase 5: DECODING → FINISHED ──────────────────────────────
-        # Poll decode_done notifications from D instances.
+        # Process decode progress and completion.
+        for msg in await queue.poll("first_token"):
+            req_id = msg.get("req_id")
+            if req_id is not None:
+                tracker.record_first_token(req_id)
+
         for msg in await queue.poll("decode_done"):
             req_id = msg.get("req_id")
             if req_id is None or req_id not in tracker:
@@ -165,9 +212,19 @@ async def schedule_loop(
                 continue
             tracker.transition(req_id, SeqState.FINISHED)
             scheduler.on_decode_finished(req.decode_instance)
+            governor.finish_request(req_id)
             tracker.remove(req_id)
 
-        # ── Phase 6: metrics snapshot ─────────────────────────────────
+        for req in tracker.get_stuck_decodes(decode_timeout_s):
+            await _abort_and_release(
+                req, scheduler, governor, queue.owner_id,
+                abort_timeout_s, include_prefill=False,
+            )
+            tracker.transition(req.req_id, SeqState.ABORTED)
+            tracker.remove(req.req_id)
+            metrics.increment("decode_abort_total", labels={"reason": "timeout"})
+
+        # Publish the current scheduler snapshot.
         metrics.gauge("active_requests", len(tracker))
         metrics.gauge(
             "waiting_requests",
@@ -178,14 +235,66 @@ async def schedule_loop(
             sum(1 for _ in tracker.iter_by_state(SeqState.KV_PENDING)),
         )
 
-        # ── sleep until next tick ─────────────────────────────────────
         elapsed = time.monotonic() - tick_start
         await asyncio.sleep(max(0.0, tick_interval_s - elapsed))
 
 
-# ---------------------------------------------------------------------------
-# KV transfer complete callback
-# ---------------------------------------------------------------------------
+async def _abort_and_release(
+    req,
+    scheduler: "PDScheduler",
+    governor: "TransferGovernor",
+    owner_id: str,
+    timeout_s: float,
+    *,
+    include_prefill: bool,
+) -> None:
+    """Release local capacity only after remote abort is acknowledged."""
+    instances = []
+    if include_prefill and req.prefill_instance:
+        instances.append(("prefill", req.prefill_instance))
+    if req.decode_instance:
+        instances.append(("decode", req.decode_instance))
+
+    for role, instance_id in instances:
+        acknowledged = await _abort_remote_request(
+            governor.infer_client, instance_id, owner_id, req.req_id, timeout_s
+        )
+        if not acknowledged:
+            # Registration must rebuild capacity that may still be held remotely.
+            scheduler.deregister_instance(instance_id)
+            continue
+        if role == "prefill":
+            scheduler.on_prefill_done(instance_id)
+        else:
+            scheduler.on_decode_finished(instance_id)
+    governor.finish_request(req.req_id)
+
+
+async def _abort_remote_request(
+    infer_client,
+    instance_id: str,
+    owner_id: str,
+    req_id: str,
+    timeout_s: float,
+) -> bool:
+    """Call the idempotent abort RPC and normalize sync and async clients."""
+    try:
+        result = infer_client.abort_request(
+            instance_id=instance_id,
+            owner_id=owner_id,
+            req_id=req_id,
+        )
+        if inspect.isawaitable(result):
+            result = await asyncio.wait_for(result, timeout=timeout_s)
+        if isinstance(result, dict):
+            return bool(result.get("success"))
+        return bool(result)
+    except Exception as exc:
+        logger.warning(
+            "remote abort failed req=%s instance=%s: %s",
+            req_id, instance_id, exc,
+        )
+        return False
 
 def _on_kv_done(
     req_id: str,

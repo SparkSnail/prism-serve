@@ -103,7 +103,7 @@ async def test_happy_path_trace_matches_reference():
 
 @pytest.mark.asyncio
 async def test_timeout_trace_drops_stale_transfer():
-    """Timeout returns to WAITING and prevents stale transfers from reviving."""
+    """Timeout recomputes on the assigned D and drops the stale transfer."""
     scheduler, governor, tracker, queue, metrics, client = _components()
     governor.update_kv_usage("d-0", 0.90)
     task = asyncio.create_task(
@@ -119,7 +119,7 @@ async def test_timeout_trace_drops_stale_transfer():
         await _wait_for_state(tracker, SeqState.KV_PENDING)
         request = tracker.get("R1")
         request.kv_sent_at = time.monotonic() - 1.0
-        await _wait_for_state(tracker, SeqState.WAITING)
+        await _wait_for_state(tracker, SeqState.RECOMPUTING)
 
         governor.update_kv_usage("d-0", 0.0)
         governor.tick()
@@ -128,8 +128,8 @@ async def test_timeout_trace_drops_stale_transfer():
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    assert tracker.get("R1").state == SeqState.WAITING
+    assert tracker.get("R1").state == SeqState.RECOMPUTING
     assert governor.deferred_depth("d-0") == 0
     assert governor.all_inflight_zero()
-    assert scheduler.decode_free_slots() == {"d-0": 1}
+    assert scheduler.decode_free_slots() == {"d-0": 0}
     client.transfer.assert_not_called()

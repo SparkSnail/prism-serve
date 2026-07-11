@@ -1,9 +1,4 @@
-"""Unit tests for NATSQueue (scheduler/queue.py) in mock mode.
-
-No real NATS server required — all tests use use_mock=True.
-Covers: connect (no-op in mock), publish (no-op in mock), poll (drain inbox),
-_put_mock (direct injection), _make_handler (JSON decode + put).
-"""
+"""NATS queue tests using the local mock transport."""
 
 from __future__ import annotations
 
@@ -16,44 +11,54 @@ from prism_serve.scheduler.queue import NATSQueue
 
 
 def make_queue() -> NATSQueue:
-    return NATSQueue({"nats_url": "nats://localhost:4222"}, use_mock=True)
+    return NATSQueue(
+        {"nats_url": "nats://localhost:4222", "scheduler_id": "serve-0"},
+        use_mock=True,
+    )
 
-
-# ---------------------------------------------------------------------------
-# connect / close (mock mode — should be silent no-ops)
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_connect_mock_is_noop():
     q = make_queue()
-    await q.connect()          # must not raise
-    assert q._nc is None       # no real connection
+    await q.connect()
+    assert q._nc is None
 
 
 @pytest.mark.asyncio
 async def test_close_mock_is_noop():
     q = make_queue()
     await q.connect()
-    await q.close()            # must not raise
+    await q.close()
     assert q._nc is None
 
-
-# ---------------------------------------------------------------------------
-# publish (mock mode — fire-and-forget, no-op)
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_publish_mock_does_not_raise():
     q = make_queue()
     await q.connect()
     await q.publish("dispatch_prefill", {"instance_id": "p-0", "req_id": "R1"})
-    # Nothing to assert — just must not raise and not put into inbox
     assert q._inbox.get("dispatch_prefill") is None
 
 
-# ---------------------------------------------------------------------------
-# poll — empty inbox
-# ---------------------------------------------------------------------------
+def test_subjects_are_scoped_to_target_and_owner():
+    q = make_queue()
+    assert q.dispatch_subject("p-0") == "dispatch_prefill.p-0"
+    assert q.reply_subject("prefill_done") == "prefill_done.serve-0"
+    assert q.reply_subject("decode_done") == "decode_done.serve-0"
+
+
+@pytest.mark.parametrize("bad_id", ["", "serve.0", "serve *", "serve>"])
+def test_subject_scope_rejects_wildcard_or_multitoken_ids(bad_id):
+    with pytest.raises(AssertionError):
+        NATSQueue({"scheduler_id": bad_id}, use_mock=True)
+
+
+@pytest.mark.asyncio
+async def test_publish_fails_when_real_connection_is_unavailable():
+    q = NATSQueue({"scheduler_id": "serve-0"})
+    with pytest.raises(ConnectionError, match="NATS unavailable"):
+        await q.publish("dispatch_prefill.p-0", {"req_id": "R1"})
+
 
 @pytest.mark.asyncio
 async def test_poll_empty_returns_empty_list():
@@ -68,10 +73,6 @@ async def test_poll_unknown_subject_returns_empty_list():
     msgs = await q.poll("does_not_exist")
     assert msgs == []
 
-
-# ---------------------------------------------------------------------------
-# _put_mock + poll — core inbox mechanics
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_put_mock_then_poll_single():
@@ -93,7 +94,6 @@ async def test_put_mock_then_poll_multiple():
 
 @pytest.mark.asyncio
 async def test_poll_drains_inbox():
-    """poll() removes messages from inbox; second poll returns empty."""
     q = make_queue()
     await q._put_mock("decode_done", {"req_id": "R1"})
     msgs1 = await q.poll("decode_done")
@@ -104,7 +104,6 @@ async def test_poll_drains_inbox():
 
 @pytest.mark.asyncio
 async def test_poll_different_subjects_independent():
-    """Messages on different subjects don't interfere."""
     q = make_queue()
     await q._put_mock("prefill_done", {"req_id": "R1"})
     await q._put_mock("decode_done",  {"req_id": "R2"})
@@ -126,13 +125,8 @@ async def test_poll_preserves_fifo_order():
     assert [m["seq"] for m in msgs] == list(range(10))
 
 
-# ---------------------------------------------------------------------------
-# _make_handler — JSON decode path (used by real NATS callbacks)
-# ---------------------------------------------------------------------------
-
 @pytest.mark.asyncio
 async def test_make_handler_valid_json():
-    """Handler correctly parses JSON and pushes into inbox."""
     q = make_queue()
     handler = q._make_handler("prefill_done")
 
@@ -146,21 +140,19 @@ async def test_make_handler_valid_json():
 
 @pytest.mark.asyncio
 async def test_make_handler_malformed_json_is_dropped():
-    """Handler silently drops malformed JSON without raising."""
     q = make_queue()
     handler = q._make_handler("prefill_done")
 
     class BadMsg:
         data = b"not valid json{{{"
 
-    await handler(BadMsg())   # must not raise
+    await handler(BadMsg())
     msgs = await q.poll("prefill_done")
     assert msgs == []
 
 
 @pytest.mark.asyncio
 async def test_make_handler_multiple_subjects_separate_inboxes():
-    """Handlers for different subjects write to separate inbox queues."""
     q = make_queue()
     h_prefill = q._make_handler("prefill_done")
     h_decode  = q._make_handler("decode_done")

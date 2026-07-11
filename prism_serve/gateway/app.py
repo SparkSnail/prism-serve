@@ -1,13 +1,4 @@
-"""FastAPI gateway: the cluster ingress for prism-serve.
-
-Manages the full lifecycle of the serve control plane via FastAPI lifespan:
-  start: metrics → governor → schedule_loop → accept requests
-  stop:  stop accepting → drain schedule_loop → drain governor → flush metrics
-
-Borrowing:
-  - lifespan start/stop ordering
-    (later-started services stopped first to preserve dependency order)
-"""
+"""FastAPI gateway and control-plane lifecycle."""
 
 from __future__ import annotations
 
@@ -16,7 +7,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from prism_serve import __version__
 from prism_serve.config import settings
@@ -24,28 +15,9 @@ from prism_serve.config import settings
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Lifespan
-# ---------------------------------------------------------------------------
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage the serve control-plane lifecycle.
-
-    Startup order:
-      1. MetricsCollector  — infrastructure; all other components report to it
-      2. TransferGovernor  — flow controller; schedule_loop depends on it
-      3. NATSQueue         — message bus; schedule_loop publishes/polls it
-      4. schedule_loop     — main loop; gateway depends on it to process reqs
-      5. accepting = True  — open the gateway to external traffic
-
-    Shutdown order
-      1. accepting = False — stop accepting new requests
-      2. cancel schedule_loop and wait (up to 60 s) for in-flight requests
-      3. drain TransferGovernor deferred queue (up to 30 s)
-      4. close NATSQueue
-      5. flush MetricsCollector
-    """
+    """Open readiness after dependencies start and reverse that order on exit."""
     from prism_serve.metrics.collector import MetricsCollector, NullMetrics
     from prism_serve.scheduler.transfer_governor import TransferGovernor
     from prism_serve.scheduler.scheduler import PDScheduler
@@ -55,7 +27,7 @@ async def lifespan(app: FastAPI):
 
     config = _build_config()
 
-    # ── 1. Metrics ────────────────────────────────────────────────────
+    # Start metrics before components that report through it.
     try:
         app.state.metrics = MetricsCollector(config)
     except Exception:
@@ -63,17 +35,14 @@ async def lifespan(app: FastAPI):
         app.state.metrics = NullMetrics()
     metrics_task = asyncio.create_task(app.state.metrics.tick_loop())
 
-    # ── 2. TransferGovernor ───────────────────────────────────────────
-    # infer_client stub; replace with real RPC client when available.
     infer_client = _make_stub_infer_client()
     app.state.governor = TransferGovernor(config, infer_client, app.state.metrics)
-    # Wire metrics ↔ governor for kv_usage propagation
     if hasattr(app.state.metrics, "set_governor"):
         app.state.metrics.set_governor(app.state.governor)
     if hasattr(app.state.metrics, "set_infer_client"):
         app.state.metrics.set_infer_client(infer_client)
 
-    # ── 3. NATS queue ─────────────────────────────────────────────────
+    # Connect NATS before accepting traffic; production fails closed.
     app.state.queue = NATSQueue(config)
     try:
         await app.state.queue.connect()
@@ -92,9 +61,11 @@ async def lifespan(app: FastAPI):
         )
         app.state.queue = NATSQueue(config, use_mock=True)
 
-    # ── 4. schedule_loop ──────────────────────────────────────────────
+    # Start scheduling after its dependencies are ready.
     app.state.tracker   = RequestTracker(app.state.metrics)
     app.state.scheduler = PDScheduler(config)
+    if hasattr(app.state.metrics, "set_scheduler"):
+        app.state.metrics.set_scheduler(app.state.scheduler)
     loop_task = asyncio.create_task(
         schedule_loop(
             app.state.scheduler,
@@ -105,41 +76,38 @@ async def lifespan(app: FastAPI):
             config,
         )
     )
+    app.state.loop_task = loop_task
+    loop_task.add_done_callback(lambda task: _on_schedule_loop_done(app, task))
 
-    # ── 5. Open to traffic ────────────────────────────────────────────
     app.state.accepting = True
     logger.info("prism-serve gateway ready (version %s)", __version__)
 
-    yield  # ← FastAPI serves external requests here
+    yield
 
-    # ── Shutdown: reverse order ───────────────────────────────────────
     logger.info("prism-serve shutting down")
 
-    # 1. Stop accepting
     app.state.accepting = False
 
-    # 2. Cancel and drain schedule_loop (max 60 s)
+    # Keep scheduling while existing requests and transfer ledgers drain.
+    await _wait_for_control_plane_drain(
+        app.state.tracker,
+        app.state.governor,
+        timeout_s=config["shutdown_drain_timeout_s"],
+    )
     loop_task.cancel()
     try:
         await asyncio.wait_for(asyncio.shield(loop_task), timeout=60.0)
     except (asyncio.CancelledError, asyncio.TimeoutError):
         pass
 
-    # 3. Drain governor deferred queue (max 30 s)
     await _drain_governor(app.state.governor, timeout_s=30.0)
 
-    # 4. Close NATS
     await app.state.queue.close()
 
-    # 5. Flush metrics
     metrics_task.cancel()
     await app.state.metrics.flush()
     logger.info("prism-serve shutdown complete")
 
-
-# ---------------------------------------------------------------------------
-# Application
-# ---------------------------------------------------------------------------
 
 app = FastAPI(
     title="prism-serve",
@@ -151,17 +119,29 @@ app = FastAPI(
 
 @app.get("/healthz")
 def healthz() -> dict:
-    """Liveness probe — process is up."""
+    """Report process liveness."""
     return {"status": "ok", "version": __version__}
 
 
 @app.get("/readyz")
 def readyz(request: Request) -> JSONResponse:
-    """Readiness probe — returns 200 only when schedule_loop is accepting."""
+    """Return ready only while the scheduler and NATS transport are healthy."""
     accepting = getattr(request.app.state, "accepting", False)
-    if accepting:
+    loop_task = getattr(request.app.state, "loop_task", None)
+    queue = getattr(request.app.state, "queue", None)
+    loop_healthy = loop_task is not None and not loop_task.done()
+    queue_healthy = queue is not None and queue.is_connected
+    if accepting and loop_healthy and queue_healthy:
         return JSONResponse({"status": "ready"})
     return JSONResponse({"status": "not_ready"}, status_code=503)
+
+
+@app.get("/metrics")
+def metrics() -> Response:
+    """Expose metrics in the Prometheus text format."""
+    from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.post("/v1/chat/completions")
@@ -184,17 +164,9 @@ def chat_completions(request: Request) -> JSONResponse:
     )
 
 
-# ---------------------------------------------------------------------------
-# Instance registration endpoint (called by infer pods on startup)
-# ---------------------------------------------------------------------------
-
 @app.post("/internal/register_instance")
 async def register_instance(request: Request) -> JSONResponse:
-    """Register a new prefill or decode infer instance.
-
-    Body: {"instance_id": "p-0", "role": "prefill" | "decode",
-           "max_slots": 127}
-    """
+    """Register a prefill or decode infer instance."""
     body = await request.json()
     scheduler = getattr(request.app.state, "scheduler", None)
     if scheduler is None:
@@ -210,22 +182,26 @@ async def register_instance(request: Request) -> JSONResponse:
     return JSONResponse({"status": "registered", "instance_id": body["instance_id"]})
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _build_config() -> dict:
     """Merge pydantic Settings into a plain dict for scheduler components."""
     return {
         "nats_url":                 settings.nats_url,
+        "nats_connect_timeout_s":   settings.nats_connect_timeout_s,
+        "nats_max_reconnect_attempts": settings.nats_max_reconnect_attempts,
         "nats_required":            settings.nats_required,
         "HIGH_WATERMARK":           settings.high_watermark,
         "LOW_WATERMARK":            settings.low_watermark,
         "MAX_BYTES_INFLIGHT":       settings.max_bytes_inflight,
         "kv_transfer_timeout_s":    settings.kv_transfer_timeout_s,
+        "prefill_timeout_s":        settings.prefill_timeout_s,
+        "max_dispatch_attempts":    settings.max_dispatch_attempts,
+        "recompute_timeout_s":      settings.recompute_timeout_s,
+        "decode_timeout_s":         settings.decode_timeout_s,
+        "abort_request_timeout_s":  settings.abort_request_timeout_s,
         "max_recompute_attempts":   settings.max_recompute_attempts,
         "schedule_loop_tick_ms":    settings.schedule_loop_tick_ms,
         "governor_tick_s":          settings.governor_tick_s,
+        "shutdown_drain_timeout_s": settings.shutdown_drain_timeout_s,
         "slot_stale_timeout_s":     settings.slot_stale_timeout_s,
         "min_decode_instances":     settings.min_decode_instances,
         "max_decode_instances":     settings.max_decode_instances,
@@ -238,12 +214,19 @@ def _make_stub_infer_client():
     """Return a no-op infer client stub (replace with real RPC client)."""
     class _Stub:
         def transfer(self, src, dst, req_id, on_complete=None):
-            logger.debug("stub transfer %s→%s req=%s", src, dst, req_id)
+            logger.debug("stub transfer %s to %s req=%s", src, dst, req_id)
             if on_complete:
                 on_complete()
 
         def reset_to_waiting(self, dst, req_id):
             logger.debug("stub reset_to_waiting dst=%s req=%s", dst, req_id)
+
+        def abort_request(self, instance_id, owner_id, req_id):
+            logger.debug(
+                "stub abort instance=%s owner=%s req=%s",
+                instance_id, owner_id, req_id,
+            )
+            return {"success": True}
 
         async def get_kv_usage_all(self) -> dict:
             return {}
@@ -255,14 +238,33 @@ async def _drain_governor(governor, timeout_s: float) -> None:
     """Wait until all in-flight KV transfers complete or timeout."""
     deadline = asyncio.get_event_loop().time() + timeout_s
     while asyncio.get_event_loop().time() < deadline:
-        if governor.all_inflight_zero():
+        if governor.is_drained():
             break
         await asyncio.sleep(0.1)
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+async def _wait_for_control_plane_drain(tracker, governor, timeout_s: float) -> bool:
+    """Wait for both request state and transfer bookkeeping to drain."""
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    while asyncio.get_event_loop().time() < deadline:
+        if len(tracker) == 0 and governor.is_drained():
+            return True
+        await asyncio.sleep(0.1)
+    return False
+
+
+def _on_schedule_loop_done(app: FastAPI, task: asyncio.Task) -> None:
+    """Fail readiness when the scheduler exits outside normal shutdown."""
+    if task.cancelled():
+        return
+    app.state.accepting = False
+    error = task.exception()
+    if error is not None:
+        logger.error(
+            "schedule_loop stopped; readiness disabled",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
 
 def main() -> None:
     """Console-script entry point: ``prism-serve``."""

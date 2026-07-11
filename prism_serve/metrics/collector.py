@@ -1,32 +1,12 @@
-"""Metrics collector for prism-serve.
-
-Provides a thin wrapper over prometheus_client that:
-  - increments counters
-  - sets gauges
-  - records histogram observations
-  - runs a periodic tick_loop to scrape kv_usage from infer instances
-
-For unit tests, a NullMetrics stub is provided that accepts all calls
-without recording anything (avoids importing prometheus_client in CI).
-
-Borrowing:
-  - Histogram for TTFT ← Prometheus best-practice (cross-instance aggregation
-    via histogram_quantile requires Histogram, not Summary)
-"""
+"""Prometheus metrics and periodic decode-instance KV usage scraping."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import time
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# NullMetrics (test stub / fallback when prometheus_client not installed)
-# ---------------------------------------------------------------------------
 
 class NullMetrics:
     """No-op metrics backend used in unit tests."""
@@ -49,10 +29,6 @@ class NullMetrics:
         pass
 
 
-# ---------------------------------------------------------------------------
-# MetricsCollector (real implementation backed by prometheus_client)
-# ---------------------------------------------------------------------------
-
 class MetricsCollector:
     """Prometheus-backed metrics collector.
 
@@ -70,7 +46,6 @@ class MetricsCollector:
         histogram_quantile(0.99, sum(rate(request_ttft_ms_bucket[5m])) by (le))
     """
 
-    # Histogram bucket boundaries for TTFT (ms)
     TTFT_BUCKETS = (1, 5, 10, 50, 100, 500, 1000, 5000, 30000)
 
     def __init__(self, config: dict) -> None:
@@ -80,6 +55,7 @@ class MetricsCollector:
         )
         self._infer_client = None  # set later via set_infer_client()
         self._governor = None      # set later via set_governor()
+        self._scheduler = None
 
         try:
             from prometheus_client import Counter, Gauge, Histogram
@@ -92,7 +68,6 @@ class MetricsCollector:
             self._available = False
             return
 
-        # --- Counters ---
         self._kv_success = Counter(
             "kv_transfer_success_total",
             "KV cache transfers completed successfully",
@@ -112,8 +87,26 @@ class MetricsCollector:
             "Times dynamic watermark rejected a transfer (per dst)",
             ["dst"],
         )
+        self._prefill_retry = Counter(
+            "prefill_dispatch_retry_total",
+            "Prefill dispatch retries after a stage deadline",
+        )
+        self._prefill_abort = Counter(
+            "prefill_dispatch_abort_total",
+            "Prefill dispatch aborts after retry exhaustion",
+            ["reason"],
+        )
+        self._decode_abort = Counter(
+            "decode_abort_total",
+            "Decode aborts after a stage deadline",
+            ["reason"],
+        )
+        self._control_message_error = Counter(
+            "control_message_error_total",
+            "Control-message operations that failed before completion",
+            ["operation"],
+        )
 
-        # --- Gauges ---
         self._active_reqs = Gauge(
             "active_requests",
             "Total active requests (all states)",
@@ -141,7 +134,6 @@ class MetricsCollector:
             "Slots held beyond stale_timeout (leak indicator; should be 0)",
         )
 
-        # --- Histograms ---
         self._ttft = Histogram(
             "request_ttft_ms",
             "Time to first token (ms)",
@@ -149,12 +141,7 @@ class MetricsCollector:
             buckets=self.TTFT_BUCKETS,
         )
 
-    # ------------------------------------------------------------------
-    # Public API (called by scheduler components)
-    # ------------------------------------------------------------------
-
     def increment(self, name: str, *, labels: dict | None = None) -> None:
-        """Increment a counter by 1."""
         if not self._available:
             return
         counter = self._counter_map().get(name)
@@ -166,7 +153,6 @@ class MetricsCollector:
             counter.inc()
 
     def gauge(self, name: str, value: float, *, labels: dict | None = None) -> None:
-        """Set a gauge to value."""
         if not self._available:
             return
         g = self._gauge_map().get(name)
@@ -178,7 +164,6 @@ class MetricsCollector:
             g.set(value)
 
     def observe(self, name: str, value: float, *, labels: dict | None = None) -> None:
-        """Record a histogram observation."""
         if not self._available:
             return
         h = self._histogram_map().get(name)
@@ -189,10 +174,6 @@ class MetricsCollector:
         else:
             h.observe(value)
 
-    # ------------------------------------------------------------------
-    # Metric name → object maps (lazy, built once)
-    # ------------------------------------------------------------------
-
     def _counter_map(self):
         if not hasattr(self, "_cm"):
             self._cm = {
@@ -200,6 +181,10 @@ class MetricsCollector:
                 "kv_transfer_recompute_total":  self._kv_recompute,
                 "kv_transfer_abort_total":      self._kv_abort,
                 "kv_transfer_congestion_total": self._kv_congestion,
+                "prefill_dispatch_retry_total": self._prefill_retry,
+                "prefill_dispatch_abort_total": self._prefill_abort,
+                "decode_abort_total":           self._decode_abort,
+                "control_message_error_total":  self._control_message_error,
             }
         return self._cm
 
@@ -222,20 +207,12 @@ class MetricsCollector:
             }
         return self._hm
 
-    # ------------------------------------------------------------------
-    # Periodic scrape loop (runs as an asyncio task)
-    # ------------------------------------------------------------------
-
     def set_infer_client(self, infer_client) -> None:
-        """Inject the interface-contract [03] client for kv_usage scraping."""
+        """Inject the client used for KV usage scraping."""
         self._infer_client = infer_client
 
     async def tick_loop(self) -> None:
-        """Periodically scrape kv_usage from D instances and update governor.
-
-        Called as an asyncio.Task from lifespan.  Interval is configurable
-        via kv_usage_scrape_interval_s (default 5 s).
-        """
+        """Periodically propagate decode KV usage to scheduler components."""
         while True:
             await asyncio.sleep(self._kv_usage_scrape_interval_s)
             await self._scrape_kv_usage()
@@ -247,9 +224,10 @@ class MetricsCollector:
         try:
             usages: dict[str, float] = await self._infer_client.get_kv_usage_all()
             for instance_id, ratio in usages.items():
-                # Propagate to governor (injected via set_governor)
                 if self._governor is not None:
                     self._governor.update_kv_usage(instance_id, ratio)
+                if self._scheduler is not None:
+                    self._scheduler.update_kv_usage(instance_id, ratio)
                 if self._available:
                     self._slot_util.labels(instance_id=instance_id).set(ratio)
         except Exception as exc:
@@ -258,6 +236,10 @@ class MetricsCollector:
     def set_governor(self, governor) -> None:
         """Inject TransferGovernor so tick_loop can push kv_usage updates."""
         self._governor = governor
+
+    def set_scheduler(self, scheduler) -> None:
+        """Share observed KV watermarks with decode instance selection."""
+        self._scheduler = scheduler
 
     async def flush(self) -> None:
         """Best-effort flush on shutdown (prometheus_client handles this)."""

@@ -1,46 +1,36 @@
-"""Unit tests for gateway/app.py.
-
-Uses httpx.AsyncClient + ASGITransport so the full FastAPI lifespan
-(startup / shutdown) runs inside each test without a real server process.
-
-Covers:
-  GET  /healthz                 — liveness probe
-  GET  /readyz                  — readiness probe (state.accepting flag)
-  POST /v1/chat/completions     — 501 when ready, 503 when not accepting
-  POST /internal/register_instance — register prefill / decode instances
-"""
+"""Gateway lifecycle and endpoint tests."""
 
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import MagicMock
 
 import pytest
 import httpx
 from fastapi.testclient import TestClient
 
 from prism_serve.gateway.app import app
+from prism_serve.gateway.app import _on_schedule_loop_done
+from prism_serve.gateway.app import _wait_for_control_plane_drain
 from prism_serve.gateway import app as gateway_module
 from prism_serve import __version__
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def sync_client() -> TestClient:
-    """Synchronous TestClient that runs lifespan on enter/exit."""
     return TestClient(app, raise_server_exceptions=True)
 
 
 @pytest.fixture(autouse=True)
 def allow_mock_nats(monkeypatch):
     """Gateway tests explicitly opt into local mock-queue mode."""
+    from prism_serve.scheduler.queue import NATSQueue
+
+    async def fail_connect(_self):
+        raise ConnectionError("test NATS unavailable")
+
     monkeypatch.setattr(gateway_module.settings, "nats_required", False)
+    monkeypatch.setattr(NATSQueue, "connect", fail_connect)
 
-
-# ---------------------------------------------------------------------------
-# /healthz
-# ---------------------------------------------------------------------------
 
 def test_healthz_returns_ok():
     with sync_client() as client:
@@ -51,12 +41,7 @@ def test_healthz_returns_ok():
     assert body["version"] == __version__
 
 
-# ---------------------------------------------------------------------------
-# /readyz
-# ---------------------------------------------------------------------------
-
 def test_readyz_ready_after_startup():
-    """Gateway sets state.accepting=True in lifespan startup."""
     with sync_client() as client:
         r = client.get("/readyz")
     assert r.status_code == 200
@@ -64,18 +49,58 @@ def test_readyz_ready_after_startup():
 
 
 def test_readyz_not_ready_before_startup():
-    """Without lifespan running, accepting is False → 503."""
-    # Instantiate a raw ASGI call without lifespan
     client = TestClient(app, raise_server_exceptions=False)
-    # Do NOT use context manager — lifespan never runs
     r = client.get("/readyz")
-    # accepting defaults to False (attribute not set) → 503
     assert r.status_code == 503
 
 
-# ---------------------------------------------------------------------------
-# /v1/chat/completions
-# ---------------------------------------------------------------------------
+def test_readyz_not_ready_when_nats_disconnects():
+    with sync_client() as client:
+        app.state.queue._use_mock = False
+        app.state.queue._nc = None
+        response = client.get("/readyz")
+        app.state.queue._use_mock = True
+    assert response.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_schedule_loop_failure_disables_readiness():
+    app.state.accepting = True
+
+    async def fail_loop():
+        raise RuntimeError("loop failed")
+
+    task = asyncio.create_task(fail_loop())
+    with pytest.raises(RuntimeError):
+        await task
+    _on_schedule_loop_done(app, task)
+
+    assert app.state.accepting is False
+
+
+def test_metrics_exposes_prometheus_payload():
+    with sync_client() as client:
+        response = client.get("/metrics")
+    assert response.status_code == 200
+    assert "text/plain" in response.headers["content-type"]
+
+
+@pytest.mark.asyncio
+async def test_control_plane_drain_waits_for_tracker_and_governor(monkeypatch):
+    tracker = MagicMock()
+    tracker.__len__.return_value = 1
+    governor = MagicMock()
+    governor.is_drained.return_value = False
+
+    async def finish_drain(_delay):
+        tracker.__len__.return_value = 0
+        governor.is_drained.return_value = True
+
+    monkeypatch.setattr(gateway_module.asyncio, "sleep", finish_drain)
+
+    assert await _wait_for_control_plane_drain(tracker, governor, 1.0)
+    assert governor.is_drained.call_count == 1
+
 
 def test_chat_completions_returns_501_when_ready():
     with sync_client() as client:
@@ -85,19 +110,13 @@ def test_chat_completions_returns_501_when_ready():
 
 
 def test_chat_completions_returns_503_when_not_accepting():
-    """If state.accepting is False, endpoint returns 503."""
     with sync_client() as client:
-        # Manually flip the flag to simulate mid-shutdown
         app.state.accepting = False
         r = client.post("/v1/chat/completions", json={})
-        app.state.accepting = True   # restore for other tests
+        app.state.accepting = True
     assert r.status_code == 503
     assert r.json()["error"] == "service_unavailable"
 
-
-# ---------------------------------------------------------------------------
-# /internal/register_instance
-# ---------------------------------------------------------------------------
 
 def test_register_prefill_instance():
     with sync_client() as client:
@@ -123,12 +142,10 @@ def test_register_decode_instance():
 
 
 def test_register_decode_without_max_slots_returns_400():
-    """Decode registration without max_slots must be rejected."""
     with sync_client() as client:
         r = client.post("/internal/register_instance", json={
             "instance_id": "d-1",
             "role": "decode",
-            # max_slots omitted → defaults to 0 → AssertionError in scheduler
         })
     assert r.status_code == 400
 
@@ -143,18 +160,14 @@ def test_register_unknown_role_returns_400():
 
 
 def test_register_missing_instance_id_returns_422():
-    """FastAPI validates missing required fields → 422."""
     with sync_client() as client:
         r = client.post("/internal/register_instance", json={
             "role": "prefill",
-            # instance_id missing
         })
-    # FastAPI request body parsing raises 422 (or 400 from our KeyError)
     assert r.status_code in (400, 422)
 
 
 def test_register_increments_scheduler_load():
-    """Registered P instance appears in scheduler._prefill_load."""
     with sync_client() as client:
         client.post("/internal/register_instance", json={
             "instance_id": "p-test",
@@ -165,7 +178,6 @@ def test_register_increments_scheduler_load():
 
 
 def test_register_decode_decrements_on_finish():
-    """Registered D instance slots are tracked correctly."""
     with sync_client() as client:
         client.post("/internal/register_instance", json={
             "instance_id": "d-test",
@@ -175,10 +187,6 @@ def test_register_decode_decrements_on_finish():
         scheduler = app.state.scheduler
         assert scheduler._decode_free_slots["d-test"] == 50
 
-
-# ---------------------------------------------------------------------------
-# Lifespan: state attributes set after startup
-# ---------------------------------------------------------------------------
 
 def test_lifespan_sets_accepting_true():
     with sync_client() as client:

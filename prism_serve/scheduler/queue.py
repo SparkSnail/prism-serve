@@ -1,71 +1,37 @@
-"""NATS publish/subscribe wrapper for prism-serve scheduler.
-
-Decouples the schedule_loop from the NATS SDK so tests can substitute a
-plain asyncio.Queue mock without a real NATS server.
-
-Design decisions:
-  1. inbox buffer: NATS callbacks are async push; the inbox converts "push"
-     to "pull" so schedule_loop can poll synchronously in each phase.
-  2. queue_group="serve": multiple serve replicas share the same group so
-     each message is processed by exactly one instance (≡ Kafka Consumer
-     Group).
-  3. Wildcard subscription "kv_usage.*": infer instances publish per their
-     own ID; serve subscribes once and handles all without restart.
-
-Borrowing:
-  - queue_group semantics ← Kafka Consumer Group
-  - subject routing       ← NATS native feature (not Kafka-comparable)
-"""
+"""NATS transport for scheduler commands and completion events."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# NATSQueue
-# ---------------------------------------------------------------------------
-
 class NATSQueue:
-    """NATS publish/subscribe wrapper.
-
-    Usage:
-        q = NATSQueue(config)
-        await q.connect()
-        ...
-        await q.publish("dispatch_prefill", {"instance_id": "p-0", ...})
-        msgs = await q.poll("prefill_done")   # non-blocking drain
-        ...
-        await q.close()
-
-    For unit tests, pass use_mock=True to bypass NATS entirely and use
-    in-process asyncio.Queue objects.
-    """
+    """Route commands to infer instances and replies to their owning gateway."""
 
     def __init__(self, config: dict, *, use_mock: bool = False) -> None:
         self._url: str = config.get("nats_url", "nats://localhost:4222")
+        self._connect_timeout_s: float = config.get("nats_connect_timeout_s", 2.0)
+        self._max_reconnect_attempts: int = config.get(
+            "nats_max_reconnect_attempts", 60
+        )
+        configured_owner = config.get("scheduler_id")
+        self._owner_id = (
+            os.getenv("HOSTNAME", "serve-local")
+            if configured_owner is None
+            else configured_owner
+        )
+        _validate_subject_token(self._owner_id, "scheduler_id")
         self._use_mock = use_mock
-        self._nc = None                                   # NATSClient | None
-        # subject → asyncio.Queue (the inbox buffer)
+        self._nc = None
         self._inbox: dict[str, asyncio.Queue] = {}
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
     async def connect(self) -> None:
-        """Connect to NATS and set up subscriptions.
-
-        Subscriptions (queue_group="serve" for all → exactly-once delivery):
-          "prefill_done"  — P instance signals prefill completed
-          "decode_done"   — D instance signals sequence finished
-          "kv_usage.*"    — D instances report KV usage (wildcard)
-        """
+        """Connect and subscribe to replies owned by this gateway."""
         if self._use_mock:
-            # Tests inject messages directly via _put_mock(); no NATS needed.
             return
 
         try:
@@ -76,25 +42,53 @@ class NATSQueue:
                 "install with: pip install nats-py"
             ) from exc
 
-        self._nc = await nats.connect(self._url)
-        # queue_group ensures exactly-one delivery across serve replicas
+        self._nc = await nats.connect(
+            self._url,
+            connect_timeout=self._connect_timeout_s,
+            retry_on_failed_connect=False,
+            max_reconnect_attempts=self._max_reconnect_attempts,
+        )
         await self._nc.subscribe(
-            "prefill_done",
-            queue="serve",
+            self.reply_subject("prefill_done"),
             cb=self._make_handler("prefill_done"),
         )
         await self._nc.subscribe(
-            "decode_done",
-            queue="serve",
+            self.reply_subject("decode_done"),
             cb=self._make_handler("decode_done"),
         )
-        # Wildcard: matches kv_usage.d-0, kv_usage.d-1, …
-        # New infer instances publish without serve restart.
+        await self._nc.subscribe(
+            self.reply_subject("recompute_done"),
+            cb=self._make_handler("recompute_done"),
+        )
+        await self._nc.subscribe(
+            self.reply_subject("first_token"),
+            cb=self._make_handler("first_token"),
+        )
         await self._nc.subscribe(
             "kv_usage.*",
             cb=self._make_handler("kv_usage"),
         )
         logger.info("NATSQueue connected to %s", self._url)
+
+    @property
+    def owner_id(self) -> str:
+        return self._owner_id
+
+    @property
+    def is_connected(self) -> bool:
+        if self._use_mock:
+            return True
+        return bool(self._nc is not None and self._nc.is_connected)
+
+    def dispatch_subject(self, instance_id: str) -> str:
+        _validate_subject_token(instance_id, "instance_id")
+        return f"dispatch_prefill.{instance_id}"
+
+    def reply_subject(self, event: str) -> str:
+        assert event in {
+            "prefill_done", "decode_done", "recompute_done", "first_token",
+        }, f"unsupported completion event: {event!r}"
+        return f"{event}.{self._owner_id}"
 
     async def close(self) -> None:
         """Drain in-flight messages and close the NATS connection."""
@@ -106,37 +100,16 @@ class NATSQueue:
                 pass
             self._nc = None
 
-    # ------------------------------------------------------------------
-    # Publish
-    # ------------------------------------------------------------------
-
     async def publish(self, subject: str, data: dict) -> None:
-        """Fire-and-forget publish.
-
-        With JetStream enabled (nats -js flag) the server persists the
-        message; without it the message is at-most-once.
-        """
+        """Publish a Core NATS message with at-most-once delivery."""
         if self._use_mock:
-            # In mock mode, publishing to "dispatch_prefill" etc. is
-            # intentionally a no-op; tests drive infer behaviour directly.
             return
-        if self._nc is None:
-            logger.warning("publish called before connect(); dropping %s", subject)
-            return
-        payload = json.dumps(data).encode()
-        await self._nc.publish(subject, payload)
-
-    # ------------------------------------------------------------------
-    # Poll (non-blocking drain)
-    # ------------------------------------------------------------------
+        if not self.is_connected:
+            raise ConnectionError(f"NATS unavailable for publish: {subject}")
+        await self._nc.publish(subject, json.dumps(data).encode())
 
     async def poll(self, subject: str) -> list[dict]:
-        """Drain all pending messages for subject from the inbox.
-
-        Non-blocking: returns an empty list if no messages are waiting.
-        Called by schedule_loop Phase 2 ("prefill_done") and Phase 5
-        ("decode_done") on every tick.
-        """
+        """Drain pending messages from one logical inbox without blocking."""
         q = self._inbox.get(subject)
         if not q:
             return []
@@ -147,10 +120,6 @@ class NATSQueue:
             except asyncio.QueueEmpty:
                 break
         return msgs
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _make_handler(self, subject: str):
         """Return a NATS message callback that pushes into the inbox queue."""
@@ -164,11 +133,17 @@ class NATSQueue:
             await inbox.put(data)
         return handler
 
-    # ------------------------------------------------------------------
-    # Test helpers (mock mode)
-    # ------------------------------------------------------------------
-
     async def _put_mock(self, subject: str, data: dict) -> None:
         """Directly inject a message into the inbox (for unit tests)."""
         inbox = self._inbox.setdefault(subject, asyncio.Queue())
         await inbox.put(data)
+
+
+def _validate_subject_token(value: str, field_name: str) -> None:
+    """Reject identifiers that would change NATS subject matching."""
+    assert value and not any(char.isspace() for char in value), (
+        f"{field_name} must be a non-empty NATS token without whitespace: {value!r}"
+    )
+    assert not any(char in value for char in ".*>"), (
+        f"{field_name} must not contain '.', '*', or '>': {value!r}"
+    )

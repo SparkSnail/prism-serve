@@ -1,10 +1,4 @@
-"""Unit tests for metrics/collector.py.
-
-Covers NullMetrics (all methods are no-ops) and MetricsCollector's public
-interface (increment / gauge / observe) in both the prometheus_client-available
-and unavailable cases.  The tick_loop and _scrape_kv_usage paths are tested
-via asyncio without a real Prometheus server.
-"""
+"""Metrics collector tests."""
 
 from __future__ import annotations
 
@@ -15,10 +9,6 @@ import pytest
 
 from prism_serve.metrics.collector import NullMetrics, MetricsCollector
 
-
-# ---------------------------------------------------------------------------
-# NullMetrics — all operations must be silent no-ops
-# ---------------------------------------------------------------------------
 
 def test_null_metrics_increment():
     m = NullMetrics()
@@ -40,10 +30,9 @@ def test_null_metrics_observe():
 
 @pytest.mark.asyncio
 async def test_null_metrics_tick_loop_is_coroutine():
-    """tick_loop must be an awaitable coroutine (not a plain function)."""
     m = NullMetrics()
     task = asyncio.create_task(m.tick_loop())
-    await asyncio.sleep(0)   # let it start
+    await asyncio.sleep(0)
     task.cancel()
     try:
         await task
@@ -54,17 +43,11 @@ async def test_null_metrics_tick_loop_is_coroutine():
 @pytest.mark.asyncio
 async def test_null_metrics_flush():
     m = NullMetrics()
-    await m.flush()   # must not raise
+    await m.flush()
 
-
-# ---------------------------------------------------------------------------
-# MetricsCollector — prometheus_client not available (graceful degradation)
-# ---------------------------------------------------------------------------
 
 def test_collector_no_prometheus_still_callable():
-    """When prometheus_client is absent, all public methods must be no-ops."""
     with patch.dict("sys.modules", {"prometheus_client": None}):
-        # Re-import to trigger the ImportError branch
         import importlib
         import prism_serve.metrics.collector as mod
         importlib.reload(mod)
@@ -75,24 +58,18 @@ def test_collector_no_prometheus_still_callable():
         mc.gauge("active_requests", 5)
         mc.observe("request_ttft_ms", 10.0, labels={"state": "FINISHED"})
 
-        # Reload to restore original module state for other tests
         importlib.reload(mod)
 
 
-# ---------------------------------------------------------------------------
-# MetricsCollector — prometheus_client available (happy path)
-# ---------------------------------------------------------------------------
-
 def _make_collector_with_mock_prometheus():
-    """Return a MetricsCollector whose prometheus objects are all MagicMocks."""
     mc = MetricsCollector.__new__(MetricsCollector)
     mc.config = {}
     mc._kv_usage_scrape_interval_s = 5.0
     mc._infer_client = None
     mc._governor = None
+    mc._scheduler = None
     mc._available = True
 
-    # Stub all prometheus objects
     def _mock_counter():
         c = MagicMock()
         c.labels.return_value = c
@@ -112,6 +89,10 @@ def _make_collector_with_mock_prometheus():
     mc._kv_recompute = _mock_counter()
     mc._kv_abort     = _mock_counter()
     mc._kv_congestion = _mock_counter()
+    mc._prefill_retry = _mock_counter()
+    mc._prefill_abort = _mock_counter()
+    mc._decode_abort = _mock_counter()
+    mc._control_message_error = _mock_counter()
 
     mc._active_reqs    = _mock_gauge()
     mc._waiting_reqs   = _mock_gauge()
@@ -140,6 +121,17 @@ def test_increment_known_counter_with_labels():
 def test_increment_unknown_name_is_noop():
     mc = _make_collector_with_mock_prometheus()
     mc.increment("nonexistent_counter")   # must not raise
+
+
+def test_increment_stage_timeout_counters():
+    mc = _make_collector_with_mock_prometheus()
+    mc.increment("prefill_dispatch_retry_total")
+    mc.increment("prefill_dispatch_abort_total", labels={"reason": "timeout"})
+    mc.increment("decode_abort_total", labels={"reason": "timeout"})
+
+    mc._prefill_retry.inc.assert_called_once()
+    mc._prefill_abort.labels.assert_called_once_with(reason="timeout")
+    mc._decode_abort.labels.assert_called_once_with(reason="timeout")
 
 
 def test_gauge_known_name_no_labels():
@@ -172,10 +164,6 @@ def test_observe_unknown_name_is_noop():
     mc.observe("no_such_histogram", 1.0)   # must not raise
 
 
-# ---------------------------------------------------------------------------
-# set_governor / set_infer_client
-# ---------------------------------------------------------------------------
-
 def test_set_governor_stores_reference():
     mc = _make_collector_with_mock_prometheus()
     gov = MagicMock()
@@ -190,9 +178,12 @@ def test_set_infer_client_stores_reference():
     assert mc._infer_client is client
 
 
-# ---------------------------------------------------------------------------
-# _scrape_kv_usage — propagates to governor + slot_util gauge
-# ---------------------------------------------------------------------------
+def test_set_scheduler_stores_reference():
+    mc = _make_collector_with_mock_prometheus()
+    scheduler = MagicMock()
+    mc.set_scheduler(scheduler)
+    assert mc._scheduler is scheduler
+
 
 @pytest.mark.asyncio
 async def test_scrape_kv_usage_propagates_to_governor():
@@ -211,10 +202,23 @@ async def test_scrape_kv_usage_propagates_to_governor():
 
 
 @pytest.mark.asyncio
+async def test_scrape_kv_usage_propagates_to_scheduler():
+    mc = _make_collector_with_mock_prometheus()
+    scheduler = MagicMock()
+    mc.set_scheduler(scheduler)
+    client = MagicMock()
+    client.get_kv_usage_all = AsyncMock(return_value={"d-0": 0.91})
+    mc.set_infer_client(client)
+
+    await mc._scrape_kv_usage()
+
+    scheduler.update_kv_usage.assert_called_once_with("d-0", 0.91)
+
+
+@pytest.mark.asyncio
 async def test_scrape_kv_usage_no_client_is_noop():
     mc = _make_collector_with_mock_prometheus()
-    # _infer_client is None by default
-    await mc._scrape_kv_usage()   # must not raise
+    await mc._scrape_kv_usage()
 
 
 @pytest.mark.asyncio
@@ -223,12 +227,8 @@ async def test_scrape_kv_usage_client_exception_is_swallowed():
     client = MagicMock()
     client.get_kv_usage_all = AsyncMock(side_effect=RuntimeError("network error"))
     mc.set_infer_client(client)
-    await mc._scrape_kv_usage()   # must not raise
+    await mc._scrape_kv_usage()
 
-
-# ---------------------------------------------------------------------------
-# tick_loop — runs and calls _scrape_kv_usage periodically
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_tick_loop_calls_scrape():
@@ -244,7 +244,7 @@ async def test_tick_loop_calls_scrape():
     mc._scrape_kv_usage = fake_scrape
 
     task = asyncio.create_task(mc.tick_loop())
-    await asyncio.sleep(0.015)   # ~15 ms → at least a few scrape calls
+    await asyncio.sleep(0.015)
     task.cancel()
     try:
         await task
@@ -254,11 +254,7 @@ async def test_tick_loop_calls_scrape():
     assert call_count >= 2, f"expected ≥2 scrape calls, got {call_count}"
 
 
-# ---------------------------------------------------------------------------
-# flush
-# ---------------------------------------------------------------------------
-
 @pytest.mark.asyncio
 async def test_flush_is_noop():
     mc = _make_collector_with_mock_prometheus()
-    await mc.flush()   # must not raise
+    await mc.flush()
