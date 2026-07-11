@@ -52,7 +52,7 @@ DEFAULT_CONFIG = {
     "MAX_BYTES_INFLIGHT":     512 * 1024 ** 2,  # 512 MB — generous for tests
     "kv_transfer_timeout_s":  0.05,             # 50 ms — fast timeout for tests
     "max_recompute_attempts": 2,
-    "schedule_loop_tick_ms":  10,
+    "schedule_loop_tick_ms":  0,
 }
 
 KV_SIZE_1BLOCK = 112 * 1024 ** 2   # 112 MB
@@ -116,6 +116,24 @@ async def run_ticks(
                 pass
 
     ml.TICK_INTERVAL_S = ml_sleep_orig
+
+
+@pytest.mark.asyncio
+async def test_schedule_loop_uses_configured_tick_interval(monkeypatch):
+    config = {**DEFAULT_CONFIG, "schedule_loop_tick_ms": 123}
+    scheduler, governor, tracker, queue, metrics, _ = make_components(config)
+    delays = []
+
+    async def capture_sleep(delay):
+        delays.append(delay)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", capture_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await schedule_loop(scheduler, governor, tracker, queue, metrics, config)
+
+    assert delays
+    assert 0.100 < delays[0] <= 0.123
 
 
 async def drive_loop(
@@ -454,6 +472,7 @@ async def test_recompute_fallback_on_timeout():
     infer_client.reset_to_waiting.assert_called_once_with("d-0", "R1")
     # Slot should be returned after recompute so it can be re-allocated
     assert scheduler._decode_free_slots["d-0"] == 10
+    assert governor.deferred_depth("d-0") == 0
 
 
 # ---------------------------------------------------------------------------

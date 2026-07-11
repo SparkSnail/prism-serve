@@ -58,6 +58,7 @@ async def schedule_loop(
     from prism_serve.scheduler.sequence_state import SeqState, TransferTask
 
     kv_transfer_timeout_s: float = config.get("kv_transfer_timeout_s", 30.0)
+    tick_interval_s = config.get("schedule_loop_tick_ms", 10) / 1000.0
 
     while True:
         tick_start = time.monotonic()
@@ -125,6 +126,7 @@ async def schedule_loop(
         # Process before Phase 4 so already-timed-out tasks are not
         # re-flushed from the deferred queue in the same tick.
         for req in tracker.get_stuck_requests(kv_transfer_timeout_s):
+            governor.cancel(req.req_id)
             decision = governor.on_transfer_failure(
                 req.req_id, req.decode_instance, "timeout"
             )
@@ -178,7 +180,7 @@ async def schedule_loop(
 
         # ── sleep until next tick ─────────────────────────────────────
         elapsed = time.monotonic() - tick_start
-        await asyncio.sleep(max(0.0, TICK_INTERVAL_S - elapsed))
+        await asyncio.sleep(max(0.0, tick_interval_s - elapsed))
 
 
 # ---------------------------------------------------------------------------

@@ -78,7 +78,18 @@ async def lifespan(app: FastAPI):
     try:
         await app.state.queue.connect()
     except Exception as exc:
-        logger.warning("NATS connect failed (%s); queue will use mock mode", exc)
+        if config.get("nats_required", True):
+            metrics_task.cancel()
+            try:
+                await metrics_task
+            except asyncio.CancelledError:
+                pass
+            raise RuntimeError(
+                "NATS connect failed; gateway refusing to become ready"
+            ) from exc
+        logger.warning(
+            "NATS connect failed (%s); using mock queue (nats_required=false)", exc
+        )
         app.state.queue = NATSQueue(config, use_mock=True)
 
     # ── 4. schedule_loop ──────────────────────────────────────────────
@@ -207,6 +218,7 @@ def _build_config() -> dict:
     """Merge pydantic Settings into a plain dict for scheduler components."""
     return {
         "nats_url":                 settings.nats_url,
+        "nats_required":            settings.nats_required,
         "HIGH_WATERMARK":           settings.high_watermark,
         "LOW_WATERMARK":            settings.low_watermark,
         "MAX_BYTES_INFLIGHT":       settings.max_bytes_inflight,

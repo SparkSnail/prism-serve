@@ -67,6 +67,8 @@ class TransferGovernor:
         self._bytes_inflight: dict[str, int]            = defaultdict(int)
         # Per-dst FIFO deferred queues (preserve ordering within each dst)
         self._deferred:       dict[str, deque[TransferTask]] = defaultdict(deque)
+        # Identity tracking invalidates callbacks from cancelled or superseded tasks.
+        self._inflight_tasks: dict[str, TransferTask] = {}
 
         # Recompute guard (prevents infinite retry loops)
         self._recompute_counts: dict[str, int] = defaultdict(int)
@@ -145,8 +147,9 @@ class TransferGovernor:
             )
 
     def _dispatch(self, task: TransferTask) -> None:
-        """Actually send: update bytes_inflight and call transfer RPC."""
+        """Actually send: update accounting, register identity, call transfer RPC."""
         self._bytes_inflight[task.dst] += task.kv_size
+        self._inflight_tasks[task.req_id] = task
         # Interface contract [03]: instruct P instance to push KV to D.
         # KVBlockPusher on the infer side executes the real NCCL P2P transfer.
         self.infer_client.transfer(
@@ -157,14 +160,36 @@ class TransferGovernor:
         )
 
     def _on_complete(self, task: TransferTask) -> None:
-        """Transfer-complete callback: release bytes, fire user callback, flush."""
+        """Release accounting and fire the callback unless the task is stale."""
+        if self._inflight_tasks.get(task.req_id) is not task:
+            return
+        del self._inflight_tasks[task.req_id]
         self._bytes_inflight[task.dst] = max(
             0, self._bytes_inflight[task.dst] - task.kv_size
         )
         if task.on_complete:
             task.on_complete()
-        self.metrics.increment("kv_transfer_success_total")
         self._flush_deferred(task.dst)
+
+    def cancel(self, req_id: str) -> bool:
+        """Cancel deferred/in-flight accounting and invalidate late callbacks."""
+        cancelled = False
+        for dst, queue in self._deferred.items():
+            kept = deque(task for task in queue if task.req_id != req_id)
+            if len(kept) != len(queue):
+                self._deferred[dst] = kept
+                cancelled = True
+                self.metrics.gauge(
+                    "deferred_queue_depth", len(kept), labels={"dst": dst}
+                )
+
+        task = self._inflight_tasks.pop(req_id, None)
+        if task is not None:
+            self._bytes_inflight[task.dst] = max(
+                0, self._bytes_inflight[task.dst] - task.kv_size
+            )
+            cancelled = True
+        return cancelled
 
     # ------------------------------------------------------------------
     # Deferred queue management

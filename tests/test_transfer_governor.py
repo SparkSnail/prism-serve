@@ -114,6 +114,44 @@ def test_on_complete_fires_user_callback():
     cb.assert_called_once()
 
 
+def test_on_complete_does_not_own_success_metric():
+    """The domain callback owns success metrics, avoiding double counting."""
+    gov, infer_client, metrics = make_governor()
+    gov.submit(_task("R1", "d-0", 112 * 1024 ** 2))
+
+    infer_client.transfer.call_args.kwargs["on_complete"]()
+
+    metrics.increment.assert_not_called()
+
+
+def test_cancel_removes_deferred_task():
+    gov, infer_client, _ = make_governor()
+    gov._kv_usage["d-0"] = 0.90
+    gov.submit(_task("R1", "d-0", 112 * 1024 ** 2))
+
+    assert gov.cancel("R1") is True
+    gov.update_kv_usage("d-0", 0.0)
+    gov.tick()
+
+    assert gov.deferred_depth("d-0") == 0
+    infer_client.transfer.assert_not_called()
+
+
+def test_cancel_inflight_ignores_late_callback():
+    gov, infer_client, _ = make_governor()
+    callback = MagicMock()
+    task = _task("R1", "d-0", 112 * 1024 ** 2)
+    task.on_complete = callback
+    gov.submit(task)
+    late_callback = infer_client.transfer.call_args.kwargs["on_complete"]
+
+    assert gov.cancel("R1") is True
+    late_callback()
+
+    assert gov.bytes_inflight("d-0") == 0
+    callback.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # deferred queue flush
 # ---------------------------------------------------------------------------

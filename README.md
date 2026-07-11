@@ -49,14 +49,20 @@ pip install -e .
 Start the gateway:
 
 ```bash
-prism-serve            # FastAPI gateway on :8080
+prism-serve            # requires NATS at nats://localhost:4222
 # or: uvicorn prism_serve.gateway.app:app --host 0.0.0.0 --port 8080
+```
+
+For gateway-only local development without NATS, explicitly enable the mock queue:
+
+```bash
+PRISM_SERVE_NATS_REQUIRED=false prism-serve
 ```
 
 Check it is alive:
 
 ```bash
-curl localhost:8080/healthz   # {"status":"ok","version":"0.0.1"}
+curl localhost:8080/healthz   # {"status":"ok","version":"0.1.0"}
 curl localhost:8080/readyz    # {"status":"ready"}
 ```
 

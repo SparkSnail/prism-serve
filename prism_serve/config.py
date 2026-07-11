@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     # ── Backing services ──────────────────────────────────────────────
     redis_url: str = "redis://localhost:6379/0"
     nats_url:  str = "nats://localhost:4222"
+    # Production fails closed; local gateway-only runs must opt into mock mode.
+    nats_required: bool = True
 
     # ── Engine RPC  ──
     engine_endpoint: str = "http://localhost:8000"

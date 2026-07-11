@@ -12,11 +12,14 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 import httpx
 from fastapi.testclient import TestClient
 
 from prism_serve.gateway.app import app
+from prism_serve.gateway import app as gateway_module
 from prism_serve import __version__
 
 
@@ -27,6 +30,12 @@ from prism_serve import __version__
 def sync_client() -> TestClient:
     """Synchronous TestClient that runs lifespan on enter/exit."""
     return TestClient(app, raise_server_exceptions=True)
+
+
+@pytest.fixture(autouse=True)
+def allow_mock_nats(monkeypatch):
+    """Gateway tests explicitly opt into local mock-queue mode."""
+    monkeypatch.setattr(gateway_module.settings, "nats_required", False)
 
 
 # ---------------------------------------------------------------------------
@@ -189,3 +198,30 @@ def test_lifespan_sets_tracker():
 def test_lifespan_sets_governor():
     with sync_client() as client:
         assert app.state.governor is not None
+
+
+def test_lifespan_fails_closed_and_cancels_metrics(monkeypatch):
+    """Required NATS prevents readiness and leaves no metrics task running."""
+    from prism_serve.scheduler.queue import NATSQueue
+
+    created_tasks = []
+    real_create_task = asyncio.create_task
+
+    def capture_task(coro):
+        task = real_create_task(coro)
+        created_tasks.append(task)
+        return task
+
+    async def fail_connect(self):
+        raise ConnectionError("nats unavailable")
+
+    monkeypatch.setattr(gateway_module.asyncio, "create_task", capture_task)
+    monkeypatch.setattr(gateway_module.settings, "nats_required", True)
+    monkeypatch.setattr(NATSQueue, "connect", fail_connect)
+
+    with pytest.raises(RuntimeError, match="NATS connect failed"):
+        with sync_client():
+            pass
+
+    assert len(created_tasks) == 1
+    assert created_tasks[0].cancelled()
