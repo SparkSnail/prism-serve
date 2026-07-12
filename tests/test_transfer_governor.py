@@ -2,7 +2,10 @@
 import pytest
 from unittest.mock import MagicMock, call
 
-from prism_serve.scheduler.transfer_governor import TransferGovernor
+from prism_serve.scheduler.transfer_governor import (
+    TransferDispatchError,
+    TransferGovernor,
+)
 from prism_serve.scheduler.sequence_state import TransferTask
 
 
@@ -28,7 +31,8 @@ def make_governor(
 
 def _task(req_id: str, dst: str, kv_size: int, priority: int = 1) -> TransferTask:
     return TransferTask(req_id=req_id, src="p-0", dst=dst,
-                        kv_size=kv_size, priority=priority)
+                        kv_size=kv_size, priority=priority,
+                        operation_id=f"op-{req_id}")
 
 
 def test_can_send_normal():
@@ -91,6 +95,27 @@ def test_submit_dispatches_when_clear():
     gov.submit(_task("R1", "d-0", 112 * 1024 ** 2))
     infer_client.transfer.assert_called_once()
     assert gov._bytes_inflight["d-0"] == 112 * 1024 ** 2
+
+
+def test_dispatch_exception_rolls_back_local_ledger():
+    gov, infer_client, _ = make_governor()
+    infer_client.transfer.side_effect = ConnectionError("transport unavailable")
+
+    with pytest.raises(TransferDispatchError):
+        gov.submit(_task("R1", "d-0", 112 * 1024 ** 2))
+
+    assert gov.bytes_inflight("d-0") == 0
+    assert gov.task_state("R1") == "none"
+    assert gov.deferred_depth("d-0") == 0
+    assert gov.is_drained()
+
+
+def test_dispatch_passes_operation_id():
+    gov, infer_client, _ = make_governor()
+
+    gov.submit(_task("R1", "d-0", 112 * 1024 ** 2))
+
+    assert infer_client.transfer.call_args.kwargs["operation_id"] == "op-R1"
 
 
 def test_submit_deferred_when_congested():

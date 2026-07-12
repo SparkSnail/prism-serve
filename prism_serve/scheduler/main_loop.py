@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import logging
 import time
+import uuid
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -29,6 +30,7 @@ async def schedule_loop(
 ) -> None:
     """Run scheduling ticks until cancelled."""
     from prism_serve.scheduler.sequence_state import SeqState, TransferTask
+    from prism_serve.scheduler.transfer_governor import TransferDispatchError
 
     kv_transfer_timeout_s: float = config.get("kv_transfer_timeout_s", 30.0)
     prefill_timeout_s: float = config.get("prefill_timeout_s", 30.0)
@@ -132,23 +134,73 @@ async def schedule_loop(
                 req_id, SeqState.KV_PENDING,
                 kv_size_bytes=kv_size,
                 block_table=blk_table,
+                transfer_operation_id=uuid.uuid4().hex,
             )
             scheduler.on_prefill_done(req.prefill_instance)
 
-            governor.submit(TransferTask(
-                req_id=req_id,
-                src=req.prefill_instance,
-                dst=req.decode_instance,
-                kv_size=kv_size,
-                on_complete=lambda rid=req_id: _on_kv_done(
-                    rid, tracker, scheduler, metrics
-                ),
-            ))
+            try:
+                governor.submit(TransferTask(
+                    req_id=req_id,
+                    operation_id=req.transfer_operation_id,
+                    src=req.prefill_instance,
+                    dst=req.decode_instance,
+                    kv_size=kv_size,
+                    on_complete=lambda rid=req_id: _on_kv_done(
+                        rid, tracker, scheduler, metrics
+                    ),
+                ))
+            except TransferDispatchError as exc:
+                metrics.increment(
+                    "kv_transfer_dispatch_error_total",
+                    labels={"dst": req.decode_instance},
+                )
+                logger.warning("KV transfer dispatch failed req=%s: %s", req_id, exc)
+                decision = governor.on_transfer_failure(
+                    req_id, req.decode_instance, "dispatch_error"
+                )
+                if decision == "recompute":
+                    governor.trigger_recompute(req_id, req.decode_instance)
+                    tracker.transition(req_id, SeqState.RECOMPUTING)
+                else:
+                    await _abort_and_release(
+                        req, scheduler, governor, queue.owner_id,
+                        abort_timeout_s, include_prefill=False,
+                    )
+                    tracker.transition(req_id, SeqState.ABORTED)
+                    tracker.remove(req_id)
 
         # Recover or abort timed-out work.
         # Process before the deferred queue flush so timed-out tasks are not
         # re-flushed from the deferred queue in the same tick.
         for req in tracker.get_stuck_requests(kv_transfer_timeout_s):
+            transfer_state = governor.task_state(req.req_id)
+            if transfer_state == "inflight":
+                stopped = await _abort_remote_transfer(
+                    governor.infer_client,
+                    req.prefill_instance,
+                    req.decode_instance,
+                    queue.owner_id,
+                    req.req_id,
+                    req.transfer_operation_id,
+                    abort_timeout_s,
+                )
+                if not stopped:
+                    governor.cancel(req.req_id)
+                    scheduler.quarantine_instance(req.decode_instance)
+                    governor.finish_request(req.req_id)
+                    tracker.transition(req.req_id, SeqState.ABORTED)
+                    tracker.remove(req.req_id)
+                    metrics.increment(
+                        "kv_transfer_abort_total",
+                        labels={"reason": "transfer_abort_unconfirmed"},
+                    )
+                    continue
+            elif transfer_state == "none":
+                scheduler.quarantine_instance(req.decode_instance)
+                governor.finish_request(req.req_id)
+                tracker.transition(req.req_id, SeqState.ABORTED)
+                tracker.remove(req.req_id)
+                continue
             governor.cancel(req.req_id)
             decision = governor.on_transfer_failure(
                 req.req_id, req.decode_instance, "timeout"
@@ -302,6 +354,48 @@ async def _abort_remote_request(
         logger.warning(
             "remote abort failed req=%s instance=%s: %s",
             req_id, instance_id, exc,
+        )
+        return False
+
+
+async def _abort_remote_transfer(
+    infer_client,
+    src_instance: str,
+    dst_instance: str,
+    owner_id: str,
+    req_id: str,
+    operation_id: str,
+    timeout_s: float,
+) -> bool:
+    """Confirm that a handed-off transfer can no longer write target KV."""
+    method = getattr(infer_client, "abort_transfer", None)
+    if method is None:
+        return False
+    try:
+        kwargs = {
+            "src_instance": src_instance,
+            "dst_instance": dst_instance,
+            "owner_id": owner_id,
+            "req_id": req_id,
+            "operation_id": operation_id,
+        }
+
+        async def invoke():
+            if inspect.iscoroutinefunction(method):
+                return await method(**kwargs)
+            result = await asyncio.to_thread(method, **kwargs)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+
+        result = await asyncio.wait_for(invoke(), timeout=timeout_s)
+        if isinstance(result, dict):
+            return bool(result.get("success"))
+        return bool(result)
+    except Exception as exc:
+        logger.warning(
+            "remote transfer abort failed req=%s operation=%s: %s",
+            req_id, operation_id, exc,
         )
         return False
 

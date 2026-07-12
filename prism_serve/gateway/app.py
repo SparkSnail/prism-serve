@@ -220,22 +220,31 @@ async def register_instance(request: Request) -> JSONResponse:
 
 @app.post("/internal/reconcile_instance")
 async def reconcile_instance(request: Request) -> JSONResponse:
-    """Restore quarantined capacity after validating the remote request set."""
+    """Fetch a fenced worker report before restoring quarantined capacity."""
     body = await request.json()
     scheduler = getattr(request.app.state, "scheduler", None)
     if scheduler is None:
         return JSONResponse({"error": "scheduler not ready"}, status_code=503)
     try:
+        report = await _get_reconciliation_report(
+            request.app.state.governor.infer_client,
+            instance_id=body["instance_id"],
+            instance_epoch=body["instance_epoch"],
+            challenge=body["reconciliation_token"],
+            timeout_s=_build_config()["reconciliation_timeout_s"],
+        )
         scheduler.reconcile_instance(
             instance_id=body["instance_id"],
             instance_epoch=body["instance_epoch"],
             reconciliation_token=body["reconciliation_token"],
             role=body["role"],
             max_slots=body.get("max_slots", 0),
-            active_request_ids=body["active_request_ids"],
+            active_request_ids=report["active_request_ids"],
         )
     except (KeyError, AssertionError, ValueError) as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
+    except (TimeoutError, ConnectionError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
     return JSONResponse({"status": "reconciled", "instance_id": body["instance_id"]})
 
 
@@ -258,6 +267,7 @@ def _build_config() -> dict:
         "recompute_timeout_s":      settings.recompute_timeout_s,
         "decode_timeout_s":         settings.decode_timeout_s,
         "abort_request_timeout_s":  settings.abort_request_timeout_s,
+        "reconciliation_timeout_s": settings.reconciliation_timeout_s,
         "max_recompute_attempts":   settings.max_recompute_attempts,
         "schedule_loop_tick_ms":    settings.schedule_loop_tick_ms,
         "governor_tick_s":          settings.governor_tick_s,
@@ -273,7 +283,7 @@ def _build_config() -> dict:
 def _make_stub_infer_client():
     """Return a no-op infer client stub (replace with real RPC client)."""
     class _Stub:
-        def transfer(self, src, dst, req_id, on_complete=None):
+        def transfer(self, src, dst, req_id, operation_id, on_complete=None):
             logger.debug("stub transfer %s to %s req=%s", src, dst, req_id)
             if on_complete:
                 on_complete()
@@ -288,10 +298,63 @@ def _make_stub_infer_client():
             )
             return {"success": True}
 
+        def abort_transfer(
+            self, src_instance, dst_instance, owner_id, req_id, operation_id
+        ):
+            logger.debug(
+                "stub abort transfer src=%s dst=%s owner=%s req=%s operation=%s",
+                src_instance, dst_instance, owner_id, req_id, operation_id,
+            )
+            return {"success": True}
+
+        def get_reconciliation_report(
+            self, instance_id, instance_epoch, challenge
+        ):
+            return {
+                "instance_id": instance_id,
+                "instance_epoch": instance_epoch,
+                "challenge": challenge,
+                "active_request_ids": [],
+            }
+
         async def get_kv_usage_all(self) -> dict:
             return {}
 
     return _Stub()
+
+
+async def _get_reconciliation_report(
+    infer_client,
+    instance_id: str,
+    instance_epoch: str,
+    challenge: str,
+    timeout_s: float,
+) -> dict:
+    """Fetch and validate an epoch- and challenge-fenced worker report."""
+    method = infer_client.get_reconciliation_report
+    kwargs = {
+        "instance_id": instance_id,
+        "instance_epoch": instance_epoch,
+        "challenge": challenge,
+    }
+
+    async def invoke():
+        if asyncio.iscoroutinefunction(method):
+            return await method(**kwargs)
+        return await asyncio.to_thread(method, **kwargs)
+
+    report = await asyncio.wait_for(invoke(), timeout=timeout_s)
+    if not isinstance(report, dict):
+        raise ValueError("invalid reconciliation report")
+    if report.get("instance_id") != instance_id:
+        raise ValueError("reconciliation instance mismatch")
+    if report.get("instance_epoch") != instance_epoch:
+        raise ValueError("reconciliation epoch mismatch")
+    if report.get("challenge") != challenge:
+        raise ValueError("reconciliation challenge mismatch")
+    if not isinstance(report.get("active_request_ids"), list):
+        raise ValueError("reconciliation active_request_ids must be a list")
+    return report
 
 
 async def _drain_governor(governor, timeout_s: float) -> None:

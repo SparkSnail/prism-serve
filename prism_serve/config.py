@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     recompute_timeout_s: float = 30.0
     decode_timeout_s: float = 300.0
     abort_request_timeout_s: float = 5.0
+    reconciliation_timeout_s: float = 5.0
     max_recompute_attempts: int = 2
 
     schedule_loop_tick_ms: int = 10   # milliseconds per tick

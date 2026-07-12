@@ -7,6 +7,10 @@ from collections import defaultdict, deque
 from prism_serve.scheduler.sequence_state import TransferTask
 
 
+class TransferDispatchError(RuntimeError):
+    """Raised when transfer dispatch fails before remote ownership begins."""
+
+
 class TransferGovernor:
     """Apply per-destination watermarks, byte caps, and retry limits."""
 
@@ -77,12 +81,23 @@ class TransferGovernor:
     def _dispatch(self, task: TransferTask) -> None:
         self._bytes_inflight[task.dst] += task.kv_size
         self._inflight_tasks[task.req_id] = task
-        self.infer_client.transfer(
-            src=task.src,
-            dst=task.dst,
-            req_id=task.req_id,
-            on_complete=lambda: self._on_complete(task),
-        )
+        try:
+            self.infer_client.transfer(
+                src=task.src,
+                dst=task.dst,
+                req_id=task.req_id,
+                operation_id=task.operation_id,
+                on_complete=lambda: self._on_complete(task),
+            )
+        except Exception as exc:
+            if self._inflight_tasks.get(task.req_id) is task:
+                del self._inflight_tasks[task.req_id]
+                self._bytes_inflight[task.dst] = max(
+                    0, self._bytes_inflight[task.dst] - task.kv_size
+                )
+            raise TransferDispatchError(
+                f"transfer dispatch failed for req={task.req_id!r}"
+            ) from exc
 
     def _on_complete(self, task: TransferTask) -> None:
         """Release accounting and fire the callback unless the task is stale."""
@@ -115,6 +130,18 @@ class TransferGovernor:
             )
             cancelled = True
         return cancelled
+
+    def task_state(self, req_id: str) -> str:
+        """Return whether a transfer is deferred, in flight, or absent."""
+        if req_id in self._inflight_tasks:
+            return "inflight"
+        if any(
+            task.req_id == req_id
+            for queue in self._deferred.values()
+            for task in queue
+        ):
+            return "deferred"
+        return "none"
 
     def tick(self) -> None:
         """Attempt to flush every deferred destination queue."""

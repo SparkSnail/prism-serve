@@ -89,6 +89,7 @@ def _make_collector_with_mock_prometheus():
     mc._kv_recompute = _mock_counter()
     mc._kv_abort     = _mock_counter()
     mc._kv_congestion = _mock_counter()
+    mc._kv_dispatch_error = _mock_counter()
     mc._prefill_retry = _mock_counter()
     mc._prefill_abort = _mock_counter()
     mc._decode_abort = _mock_counter()
@@ -132,6 +133,12 @@ def test_increment_stage_timeout_counters():
     mc._prefill_retry.inc.assert_called_once()
     mc._prefill_abort.labels.assert_called_once_with(reason="timeout")
     mc._decode_abort.labels.assert_called_once_with(reason="timeout")
+
+
+def test_increment_transfer_dispatch_error():
+    mc = _make_collector_with_mock_prometheus()
+    mc.increment("kv_transfer_dispatch_error_total", labels={"dst": "d-0"})
+    mc._kv_dispatch_error.labels.assert_called_once_with(dst="d-0")
 
 
 def test_gauge_known_name_no_labels():

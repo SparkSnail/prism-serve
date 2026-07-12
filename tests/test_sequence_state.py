@@ -182,13 +182,14 @@ def test_len_and_contains():
 
 
 def test_instance_slot_compute_max_slots():
+    # TP=1 reference: four 28 MiB blocks use 112 MiB per average sequence.
     n = InstanceSlot.compute_max_slots(
         gpu_memory_gb=80.0,
         model_weight_gb=14.0,
-        avg_seq_kv_gb=0.44,
+        avg_seq_kv_gb=0.109375,
         safety_margin=0.85,
     )
-    assert 120 <= n <= 135, f"expected ~127, got {n}"
+    assert 510 <= n <= 513, f"expected ~512, got {n}"
 
 
 def test_instance_slot_is_stale():

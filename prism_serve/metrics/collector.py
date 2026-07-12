@@ -87,6 +87,11 @@ class MetricsCollector:
             "Times dynamic watermark rejected a transfer (per dst)",
             ["dst"],
         )
+        self._kv_dispatch_error = Counter(
+            "kv_transfer_dispatch_error_total",
+            "Transfer RPC failures before remote handoff",
+            ["dst"],
+        )
         self._prefill_retry = Counter(
             "prefill_dispatch_retry_total",
             "Prefill dispatch retries after a stage deadline",
@@ -181,6 +186,7 @@ class MetricsCollector:
                 "kv_transfer_recompute_total":  self._kv_recompute,
                 "kv_transfer_abort_total":      self._kv_abort,
                 "kv_transfer_congestion_total": self._kv_congestion,
+                "kv_transfer_dispatch_error_total": self._kv_dispatch_error,
                 "prefill_dispatch_retry_total": self._prefill_retry,
                 "prefill_dispatch_abort_total": self._prefill_abort,
                 "decode_abort_total":           self._decode_abort,

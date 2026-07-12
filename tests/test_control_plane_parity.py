@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -34,6 +34,7 @@ KV_SIZE = 112 * 1024**2
 def _components():
     metrics = NullMetrics()
     client = MagicMock()
+    client.abort_transfer = AsyncMock(return_value={"success": True})
     governor = TransferGovernor(CONFIG, client, metrics)
     scheduler = PDScheduler(CONFIG)
     tracker = RequestTracker(metrics)
@@ -64,7 +65,7 @@ async def test_happy_path_trace_matches_reference():
     """Completion events produce the expected request-state trace."""
     scheduler, governor, tracker, queue, metrics, client = _components()
     client.transfer.side_effect = (
-        lambda src, dst, req_id, on_complete=None: on_complete()
+        lambda src, dst, req_id, operation_id, on_complete=None: on_complete()
         if on_complete else None
     )
     observed = [tracker.get("R1").state.name]

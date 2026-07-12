@@ -43,6 +43,7 @@ class RequestInfo:
 
     kv_size_bytes: int = 0
     block_table:   list[int] = field(default_factory=list)
+    transfer_operation_id: str = ""
 
     def ttft_ms(self) -> float:
         """Return first-token latency in milliseconds, or -1 if unknown."""
@@ -111,6 +112,7 @@ class TransferTask:
     priority:    int = 1       # 1 = normal PD; 0 = migration/replica (stricter cap)
     enqueued_at: float = field(default_factory=time.monotonic)
     on_complete: object = None  # Callable[[], None] | None
+    operation_id: str = ""
 
 
 def _validate_transition(current: SeqState, new: SeqState) -> None:

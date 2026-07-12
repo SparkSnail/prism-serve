@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import httpx
@@ -293,17 +293,24 @@ def test_quarantined_instance_requires_reconciliation():
         assert retry.status_code == 409
         assert retry.json()["reconciliation_token"] == record.reconciliation_token
 
-        active = client.post("/internal/reconcile_instance", json={
-            "instance_id": "d-quarantine",
-            "instance_epoch": "epoch-2",
-            "reconciliation_token": record.reconciliation_token,
-            "role": "decode",
-            "max_slots": 4,
-            "active_request_ids": ["stale-request"],
-        })
-        assert active.status_code == 400
+        app.state.governor.infer_client.get_reconciliation_report = MagicMock(
+            side_effect=[
+                {
+                    "instance_id": "d-quarantine",
+                    "instance_epoch": "epoch-2",
+                    "challenge": record.reconciliation_token,
+                    "active_request_ids": ["stale-request"],
+                },
+                {
+                    "instance_id": "d-quarantine",
+                    "instance_epoch": "epoch-2",
+                    "challenge": record.reconciliation_token,
+                    "active_request_ids": [],
+                },
+            ]
+        )
 
-        reconciled = client.post("/internal/reconcile_instance", json={
+        active = client.post("/internal/reconcile_instance", json={
             "instance_id": "d-quarantine",
             "instance_epoch": "epoch-2",
             "reconciliation_token": record.reconciliation_token,
@@ -311,8 +318,80 @@ def test_quarantined_instance_requires_reconciliation():
             "max_slots": 4,
             "active_request_ids": [],
         })
+        assert active.status_code == 400
+        assert app.state.scheduler.quarantine_record("d-quarantine") is not None
+
+        reconciled = client.post("/internal/reconcile_instance", json={
+            "instance_id": "d-quarantine",
+            "instance_epoch": "epoch-2",
+            "reconciliation_token": record.reconciliation_token,
+            "role": "decode",
+            "max_slots": 4,
+            "active_request_ids": ["untrusted-request-body"],
+        })
         assert reconciled.status_code == 200
         assert app.state.scheduler.decode_free_slots()["d-quarantine"] == 4
+
+
+def test_reconciliation_rejects_unfenced_worker_report():
+    with sync_client() as client:
+        client.post("/internal/register_instance", json={
+            "instance_id": "d-fenced",
+            "instance_epoch": "epoch-1",
+            "role": "decode",
+            "max_slots": 2,
+            "active_request_ids": [],
+        })
+        record = app.state.scheduler.quarantine_instance("d-fenced")
+        app.state.governor.infer_client.get_reconciliation_report = MagicMock(
+            return_value={
+                "instance_id": "d-fenced",
+                "instance_epoch": "wrong-epoch",
+                "challenge": record.reconciliation_token,
+                "active_request_ids": [],
+            }
+        )
+
+        response = client.post("/internal/reconcile_instance", json={
+            "instance_id": "d-fenced",
+            "instance_epoch": "epoch-2",
+            "reconciliation_token": record.reconciliation_token,
+            "role": "decode",
+            "max_slots": 2,
+        })
+
+        assert response.status_code == 400
+        assert app.state.scheduler.quarantine_record("d-fenced") is not None
+
+
+def test_reconciliation_timeout_keeps_instance_quarantined(monkeypatch):
+    async def never_returns(**_kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(gateway_module.settings, "reconciliation_timeout_s", 0.01)
+    with sync_client() as client:
+        client.post("/internal/register_instance", json={
+            "instance_id": "d-timeout",
+            "instance_epoch": "epoch-1",
+            "role": "decode",
+            "max_slots": 2,
+            "active_request_ids": [],
+        })
+        record = app.state.scheduler.quarantine_instance("d-timeout")
+        app.state.governor.infer_client.get_reconciliation_report = AsyncMock(
+            side_effect=never_returns
+        )
+
+        response = client.post("/internal/reconcile_instance", json={
+            "instance_id": "d-timeout",
+            "instance_epoch": "epoch-2",
+            "reconciliation_token": record.reconciliation_token,
+            "role": "decode",
+            "max_slots": 2,
+        })
+
+        assert response.status_code == 503
+        assert app.state.scheduler.quarantine_record("d-timeout") is not None
 
 
 def test_lifespan_sets_accepting_true():

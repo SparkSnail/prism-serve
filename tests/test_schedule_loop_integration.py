@@ -30,7 +30,7 @@ DEFAULT_CONFIG = {
     "schedule_loop_tick_ms":  0,
 }
 
-KV_SIZE_1BLOCK = 112 * 1024 ** 2   # 112 MB
+KV_SIZE_1BLOCK = 28 * 1024 ** 2   # TP=1 reference block: 28 MiB
 
 
 def make_components(config: dict | None = None):
@@ -38,10 +38,12 @@ def make_components(config: dict | None = None):
     metrics = NullMetrics()
     infer_client = MagicMock()
     infer_client.transfer.side_effect = (
-        lambda src, dst, req_id, on_complete=None: on_complete() if on_complete else None
+        lambda src, dst, req_id, operation_id, on_complete=None:
+        on_complete() if on_complete else None
     )
     infer_client.reset_to_waiting = MagicMock()
     infer_client.abort_request = AsyncMock(return_value={"success": True})
+    infer_client.abort_transfer = AsyncMock(return_value={"success": True})
 
     governor = TransferGovernor(cfg, infer_client, metrics)
     scheduler = PDScheduler(cfg)
@@ -164,7 +166,7 @@ async def test_happy_path_single():
     decode_injected = False
     orig_transfer = infer_client.transfer.side_effect
 
-    def transfer_and_decode(src, dst, req_id, on_complete=None):
+    def transfer_and_decode(src, dst, req_id, operation_id, on_complete=None):
         nonlocal decode_injected
         if on_complete:
             on_complete()
@@ -223,7 +225,7 @@ async def test_happy_path_four_concurrent():
     prefill_injected: set[str] = set()
     decode_injected: set[str] = set()
 
-    def transfer_side_effect(src, dst, req_id, on_complete=None):
+    def transfer_side_effect(src, dst, req_id, operation_id, on_complete=None):
         if on_complete:
             on_complete()
         decode_injected.add(req_id)
@@ -284,7 +286,8 @@ async def test_kv_transfer_deferred_then_flushed():
     governor._kv_usage["d-0"] = 0.90
 
     infer_client.transfer.side_effect = (
-        lambda src, dst, req_id, on_complete=None: on_complete() if on_complete else None
+        lambda src, dst, req_id, operation_id, on_complete=None:
+        on_complete() if on_complete else None
     )
 
     req = RequestInfo(req_id="R1", kv_size_bytes=KV_SIZE_1BLOCK)
@@ -346,7 +349,9 @@ async def test_recompute_fallback_on_timeout():
     scheduler.register_instance("p-0", "prefill")
     scheduler.register_instance("d-0", "decode", max_slots=10)
 
-    infer_client.transfer.side_effect = lambda src, dst, req_id, on_complete=None: None
+    infer_client.transfer.side_effect = (
+        lambda src, dst, req_id, operation_id, on_complete=None: None
+    )
 
     req = RequestInfo(req_id="R1", kv_size_bytes=KV_SIZE_1BLOCK)
     tracker.add(req)
@@ -395,8 +400,82 @@ async def test_recompute_fallback_on_timeout():
     assert r.state == SeqState.RECOMPUTING
     assert governor._recompute_counts["R1"] == 1
     infer_client.reset_to_waiting.assert_called_once_with("d-0", "R1")
+    infer_client.abort_transfer.assert_awaited_once()
     assert scheduler._decode_free_slots["d-0"] == 9
     assert governor.deferred_depth("d-0") == 0
+
+
+@pytest.mark.asyncio
+async def test_transfer_abort_failure_quarantines_before_recompute():
+    config = {**DEFAULT_CONFIG, "kv_transfer_timeout_s": 0.01}
+    scheduler, governor, tracker, queue, metrics, infer_client = make_components(config)
+    scheduler.register_instance("p-0", "prefill")
+    scheduler.register_instance("d-0", "decode", max_slots=1)
+    infer_client.transfer.side_effect = lambda **_kwargs: None
+    infer_client.abort_transfer = AsyncMock(return_value={"success": False})
+    tracker.add(RequestInfo(req_id="R1", kv_size_bytes=KV_SIZE_1BLOCK))
+
+    task = asyncio.create_task(
+        schedule_loop(scheduler, governor, tracker, queue, metrics, config)
+    )
+    try:
+        for _ in range(200):
+            await asyncio.sleep(0)
+            request = tracker.get("R1")
+            if request and request.state == SeqState.PREFILLING:
+                await queue._put_mock("prefill_done", {
+                    "req_id": "R1",
+                    "kv_size_bytes": KV_SIZE_1BLOCK,
+                    "block_table": [3],
+                })
+            if request and request.state == SeqState.KV_PENDING:
+                request.kv_sent_at = time.monotonic() - 1.0
+            if "R1" not in tracker:
+                break
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert "R1" not in tracker
+    assert scheduler.quarantine_record("d-0") is not None
+    assert "d-0" not in scheduler.decode_free_slots()
+    infer_client.reset_to_waiting.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_transfer_dispatch_error_does_not_stop_schedule_loop():
+    scheduler, governor, tracker, queue, metrics, infer_client = make_components()
+    scheduler.register_instance("p-0", "prefill")
+    scheduler.register_instance("d-0", "decode", max_slots=1)
+    infer_client.transfer.side_effect = ConnectionError("transport unavailable")
+    tracker.add(RequestInfo(req_id="R1", kv_size_bytes=KV_SIZE_1BLOCK))
+
+    task = asyncio.create_task(
+        schedule_loop(scheduler, governor, tracker, queue, metrics, DEFAULT_CONFIG)
+    )
+    try:
+        for _ in range(100):
+            await asyncio.sleep(0)
+            request = tracker.get("R1")
+            if request and request.state == SeqState.PREFILLING:
+                await queue._put_mock("prefill_done", {
+                    "req_id": "R1",
+                    "kv_size_bytes": KV_SIZE_1BLOCK,
+                    "block_table": [3],
+                })
+            if request and request.state == SeqState.RECOMPUTING:
+                break
+        assert not task.done()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    request = tracker.get("R1")
+    assert request is not None and request.state == SeqState.RECOMPUTING
+    assert governor.is_drained()
+    infer_client.reset_to_waiting.assert_called_once_with("d-0", "R1")
 
 
 @pytest.mark.asyncio
@@ -410,7 +489,9 @@ async def test_abort_after_max_recompute():
     scheduler.register_instance("p-0", "prefill")
     scheduler.register_instance("d-0", "decode", max_slots=10)
 
-    infer_client.transfer.side_effect = lambda src, dst, req_id, on_complete=None: None
+    infer_client.transfer.side_effect = (
+        lambda src, dst, req_id, operation_id, on_complete=None: None
+    )
 
     req = RequestInfo(req_id="R1", kv_size_bytes=KV_SIZE_1BLOCK)
     tracker.add(req)
