@@ -185,6 +185,21 @@ def test_cancel_inflight_ignores_late_callback():
     callback.assert_not_called()
 
 
+def test_operation_scoped_ownership_and_cancel_reject_stale_operation():
+    gov, _, _ = make_governor()
+    task = _task("R1", "d-0", 112 * 1024 ** 2)
+    task.operation_id = "op-current"
+    gov.submit(task)
+
+    assert gov.owns("R1", "op-current")
+    assert not gov.owns("R1", "op-stale")
+    assert gov.task_state("R1", "op-stale") == "none"
+    assert not gov.cancel("R1", "op-stale")
+    assert gov.owns("R1", "op-current")
+    assert gov.cancel("R1", "op-current")
+    assert gov.is_drained()
+
+
 def test_flush_deferred_on_low_watermark():
     gov, infer_client, _ = make_governor()
     gov._kv_usage["d-0"] = 0.90   # congested

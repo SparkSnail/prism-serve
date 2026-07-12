@@ -145,8 +145,8 @@ async def schedule_loop(
                     src=req.prefill_instance,
                     dst=req.decode_instance,
                     kv_size=kv_size,
-                    on_complete=lambda rid=req_id: _on_kv_done(
-                        rid, tracker, scheduler, metrics
+                    on_complete=lambda rid=req_id, op=req.transfer_operation_id: _on_kv_done(
+                        rid, op, tracker, scheduler, metrics
                     ),
                 ))
             except TransferDispatchError as exc:
@@ -173,7 +173,12 @@ async def schedule_loop(
         # Process before the deferred queue flush so timed-out tasks are not
         # re-flushed from the deferred queue in the same tick.
         for req in tracker.get_stuck_requests(kv_transfer_timeout_s):
-            transfer_state = governor.task_state(req.req_id)
+            operation_id = req.transfer_operation_id
+            if not _matches_pending_operation(
+                req.req_id, operation_id, tracker
+            ):
+                continue
+            transfer_state = governor.task_state(req.req_id, operation_id)
             if transfer_state == "inflight":
                 stopped = await _abort_remote_transfer(
                     governor.infer_client,
@@ -181,11 +186,16 @@ async def schedule_loop(
                     req.decode_instance,
                     queue.owner_id,
                     req.req_id,
-                    req.transfer_operation_id,
+                    operation_id,
                     abort_timeout_s,
                 )
+                if not _owns_pending_transfer(
+                    req.req_id, operation_id, tracker, governor
+                ):
+                    # Completion or cancellation won while abort was pending.
+                    continue
                 if not stopped:
-                    governor.cancel(req.req_id)
+                    governor.cancel(req.req_id, operation_id)
                     scheduler.quarantine_instance(req.decode_instance)
                     governor.finish_request(req.req_id)
                     tracker.transition(req.req_id, SeqState.ABORTED)
@@ -201,7 +211,7 @@ async def schedule_loop(
                 tracker.transition(req.req_id, SeqState.ABORTED)
                 tracker.remove(req.req_id)
                 continue
-            governor.cancel(req.req_id)
+            governor.cancel(req.req_id, operation_id)
             decision = governor.on_transfer_failure(
                 req.req_id, req.decode_instance, "timeout"
             )
@@ -402,6 +412,7 @@ async def _abort_remote_transfer(
 
 def _on_kv_done(
     req_id: str,
+    operation_id: str,
     tracker: "RequestTracker",
     scheduler: "PDScheduler",
     metrics,
@@ -411,8 +422,40 @@ def _on_kv_done(
     req = tracker.get(req_id)
     if req is None:
         return
-    if req.state != SeqState.KV_PENDING:
+    if (
+        req.state != SeqState.KV_PENDING
+        or req.transfer_operation_id != operation_id
+    ):
         # Request was already recomputed or aborted; ignore stale callback.
         return
     tracker.transition(req_id, SeqState.DECODING)
     metrics.increment("kv_transfer_success_total")
+
+
+def _matches_pending_operation(
+    req_id: str,
+    operation_id: str,
+    tracker: "RequestTracker",
+) -> bool:
+    """Return whether the tracker still binds the pending operation."""
+    from prism_serve.scheduler.sequence_state import SeqState
+
+    req = tracker.get(req_id)
+    return bool(
+        req is not None
+        and req.state == SeqState.KV_PENDING
+        and req.transfer_operation_id == operation_id
+    )
+
+
+def _owns_pending_transfer(
+    req_id: str,
+    operation_id: str,
+    tracker: "RequestTracker",
+    governor: "TransferGovernor",
+) -> bool:
+    """Return whether tracker and governor still own the same operation."""
+    return (
+        _matches_pending_operation(req_id, operation_id, tracker)
+        and governor.owns(req_id, operation_id)
+    )

@@ -444,6 +444,116 @@ async def test_transfer_abort_failure_quarantines_before_recompute():
 
 
 @pytest.mark.asyncio
+async def test_late_completion_during_transfer_abort_await_wins_once():
+    config = {**DEFAULT_CONFIG, "kv_transfer_timeout_s": 0.01}
+    scheduler, governor, tracker, queue, metrics, infer_client = make_components(config)
+    scheduler.register_instance("p-0", "prefill")
+    scheduler.register_instance("d-0", "decode", max_slots=1)
+    infer_client.transfer.side_effect = lambda **_kwargs: None
+    abort_started = asyncio.Event()
+    allow_abort_reply = asyncio.Event()
+
+    async def abort_transfer(**_kwargs):
+        abort_started.set()
+        await allow_abort_reply.wait()
+        return {"success": True}
+
+    infer_client.abort_transfer.side_effect = abort_transfer
+    tracker.add(RequestInfo(req_id="R1", kv_size_bytes=KV_SIZE_1BLOCK))
+
+    task = asyncio.create_task(
+        schedule_loop(scheduler, governor, tracker, queue, metrics, config)
+    )
+    prefill_injected = False
+    try:
+        for _ in range(200):
+            await asyncio.sleep(0)
+            request = tracker.get("R1")
+            if request and request.state == SeqState.PREFILLING and not prefill_injected:
+                await queue._put_mock("prefill_done", {
+                    "req_id": "R1",
+                    "kv_size_bytes": KV_SIZE_1BLOCK,
+                    "block_table": [3],
+                })
+                prefill_injected = True
+            if request and request.state == SeqState.KV_PENDING:
+                request.kv_sent_at = time.monotonic() - 1.0
+            if abort_started.is_set():
+                break
+
+        await asyncio.wait_for(abort_started.wait(), timeout=1.0)
+        completion = infer_client.transfer.call_args.kwargs["on_complete"]
+        completion()
+        assert tracker.get("R1").state == SeqState.DECODING
+
+        allow_abort_reply.set()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not task.done()
+        assert tracker.get("R1").state == SeqState.DECODING
+        assert governor._recompute_counts.get("R1", 0) == 0
+        infer_client.reset_to_waiting.assert_not_called()
+
+        await queue._put_mock("decode_done", {"req_id": "R1"})
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if "R1" not in tracker:
+                break
+    finally:
+        allow_abort_reply.set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert "R1" not in tracker
+    assert scheduler.decode_free_slots() == {"d-0": 1}
+    assert governor.is_drained()
+
+
+@pytest.mark.asyncio
+async def test_transfer_ownership_loss_quarantines_and_terminates():
+    config = {**DEFAULT_CONFIG, "kv_transfer_timeout_s": 0.01}
+    scheduler, governor, tracker, queue, metrics, infer_client = make_components(config)
+    scheduler.register_instance("p-0", "prefill")
+    scheduler.register_instance("d-0", "decode", max_slots=1)
+    infer_client.transfer.side_effect = lambda **_kwargs: None
+    tracker.add(RequestInfo(req_id="R1", kv_size_bytes=KV_SIZE_1BLOCK))
+
+    task = asyncio.create_task(
+        schedule_loop(scheduler, governor, tracker, queue, metrics, config)
+    )
+    prefill_injected = False
+    try:
+        for _ in range(200):
+            await asyncio.sleep(0)
+            request = tracker.get("R1")
+            if request and request.state == SeqState.PREFILLING and not prefill_injected:
+                await queue._put_mock("prefill_done", {
+                    "req_id": "R1",
+                    "kv_size_bytes": KV_SIZE_1BLOCK,
+                    "block_table": [3],
+                })
+                prefill_injected = True
+            if request and request.state == SeqState.KV_PENDING:
+                operation_id = request.transfer_operation_id
+                assert governor.cancel("R1", operation_id)
+                request.kv_sent_at = time.monotonic() - 1.0
+            if "R1" not in tracker:
+                break
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert "R1" not in tracker
+    assert scheduler.quarantine_record("d-0") is not None
+    assert "d-0" not in scheduler.decode_free_slots()
+    assert governor.is_drained()
+    infer_client.abort_transfer.assert_not_called()
+    infer_client.reset_to_waiting.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_transfer_dispatch_error_does_not_stop_schedule_loop():
     scheduler, governor, tracker, queue, metrics, infer_client = make_components()
     scheduler.register_instance("p-0", "prefill")

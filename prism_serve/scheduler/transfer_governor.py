@@ -111,11 +111,28 @@ class TransferGovernor:
             task.on_complete()
         self._flush_deferred(task.dst)
 
-    def cancel(self, req_id: str) -> bool:
-        """Cancel deferred/in-flight accounting and invalidate late callbacks."""
+    def owns(self, req_id: str, operation_id: str) -> bool:
+        """Return whether the ledger owns the specified operation."""
+        task = self._inflight_tasks.get(req_id)
+        if task is not None:
+            return task.operation_id == operation_id
+        return any(
+            task.req_id == req_id and task.operation_id == operation_id
+            for queue in self._deferred.values()
+            for task in queue
+        )
+
+    def cancel(self, req_id: str, operation_id: str | None = None) -> bool:
+        """Cancel matching accounting and invalidate its late callback."""
         cancelled = False
         for dst, queue in self._deferred.items():
-            kept = deque(task for task in queue if task.req_id != req_id)
+            kept = deque(
+                task for task in queue
+                if not (
+                    task.req_id == req_id
+                    and (operation_id is None or task.operation_id == operation_id)
+                )
+            )
             if len(kept) != len(queue):
                 self._deferred[dst] = kept
                 cancelled = True
@@ -123,20 +140,27 @@ class TransferGovernor:
                     "deferred_queue_depth", len(kept), labels={"dst": dst}
                 )
 
-        task = self._inflight_tasks.pop(req_id, None)
-        if task is not None:
+        task = self._inflight_tasks.get(req_id)
+        if task is not None and (
+            operation_id is None or task.operation_id == operation_id
+        ):
+            del self._inflight_tasks[req_id]
             self._bytes_inflight[task.dst] = max(
                 0, self._bytes_inflight[task.dst] - task.kv_size
             )
             cancelled = True
         return cancelled
 
-    def task_state(self, req_id: str) -> str:
+    def task_state(self, req_id: str, operation_id: str | None = None) -> str:
         """Return whether a transfer is deferred, in flight, or absent."""
-        if req_id in self._inflight_tasks:
+        task = self._inflight_tasks.get(req_id)
+        if task is not None and (
+            operation_id is None or task.operation_id == operation_id
+        ):
             return "inflight"
         if any(
             task.req_id == req_id
+            and (operation_id is None or task.operation_id == operation_id)
             for queue in self._deferred.values()
             for task in queue
         ):
