@@ -38,7 +38,12 @@ class Settings(BaseSettings):
     # Per-dst in-flight byte cap (secondary guard, bytes)
     max_bytes_inflight: int = 256 * 1024 * 1024  # 256 MB
 
+    # ── recompute fallback ───────────────────────────────────────────────
+    # Unconfirmed transfers fall back after this deadline.
     kv_transfer_timeout_s: float = 30.0
+    abort_transfer_timeout_s: float = 5.0
+    kv_usage_stale_after_s: float = 10.0
+    # Retry lost dispatch/prefill_done messages against the original assignment.
     prefill_timeout_s: float = 30.0
     max_dispatch_attempts: int = 3
     recompute_timeout_s: float = 30.0

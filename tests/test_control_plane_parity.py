@@ -15,7 +15,7 @@ import pytest
 from prism_serve.metrics.collector import NullMetrics
 from prism_serve.scheduler.main_loop import schedule_loop
 from prism_serve.scheduler.queue import NATSQueue
-from prism_serve.scheduler.scheduler import PDScheduler
+from prism_serve.scheduler.scheduler import KVUsageSample, PDScheduler
 from prism_serve.scheduler.sequence_state import RequestInfo, RequestTracker, SeqState
 from prism_serve.scheduler.transfer_governor import TransferGovernor
 
@@ -41,7 +41,22 @@ def _components():
     queue = NATSQueue(CONFIG, use_mock=True)
     scheduler.register_instance("p-0", "prefill")
     scheduler.register_instance("d-0", "decode", max_slots=1)
+    sample = KVUsageSample(0.0, "legacy:d-0", time.monotonic())
+    scheduler.update_kv_usage("d-0", sample)
+    governor.set_expected_epochs(scheduler.decode_instance_epochs())
+    governor.update_kv_usage("d-0", sample)
     tracker.add(RequestInfo(req_id="R1", kv_size_bytes=KV_SIZE))
+    original_put_mock = queue._put_mock
+
+    async def put_with_epoch(subject: str, data: dict) -> None:
+        payload = dict(data)
+        if subject == "prefill_done":
+            payload.setdefault("instance_epoch", "legacy:p-0")
+        elif subject in {"first_token", "recompute_done", "decode_done"}:
+            payload.setdefault("instance_epoch", "legacy:d-0")
+        await original_put_mock(subject, payload)
+
+    queue._put_mock = put_with_epoch
     return scheduler, governor, tracker, queue, metrics, client
 
 
@@ -106,7 +121,9 @@ async def test_happy_path_trace_matches_reference():
 async def test_timeout_trace_drops_stale_transfer():
     """Timeout recomputes on the assigned D and drops the stale transfer."""
     scheduler, governor, tracker, queue, metrics, client = _components()
-    governor.update_kv_usage("d-0", 0.90)
+    governor.update_kv_usage(
+        "d-0", KVUsageSample(0.90, "legacy:d-0", time.monotonic())
+    )
     task = asyncio.create_task(
         schedule_loop(scheduler, governor, tracker, queue, metrics, CONFIG)
     )
@@ -122,7 +139,9 @@ async def test_timeout_trace_drops_stale_transfer():
         request.kv_sent_at = time.monotonic() - 1.0
         await _wait_for_state(tracker, SeqState.RECOMPUTING)
 
-        governor.update_kv_usage("d-0", 0.0)
+        governor.update_kv_usage(
+            "d-0", KVUsageSample(0.0, "legacy:d-0", time.monotonic())
+        )
         governor.tick()
     finally:
         task.cancel()

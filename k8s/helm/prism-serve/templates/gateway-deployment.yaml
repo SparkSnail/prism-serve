@@ -7,6 +7,8 @@ metadata:
     app.kubernetes.io/component: gateway
 spec:
   replicas: {{ .Values.gateway.replicas }}
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "prism-serve.gateway.selectorLabels" . | nindent 6 }}

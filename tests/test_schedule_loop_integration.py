@@ -9,10 +9,23 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from prism_serve.metrics.collector import NullMetrics
-from prism_serve.scheduler.main_loop import _abort_remote_request, schedule_loop
+from prism_serve.gateway.app import _abort_remaining_requests
+from prism_serve.scheduler.main_loop import schedule_loop
+from prism_serve.scheduler.main_loop import _abort_remote_request
+from prism_serve.scheduler.main_loop import (
+    CleanupProof,
+    RemoteRequestState,
+    TransferCleanupState,
+    d_slot_releasable,
+    p_load_releasable,
+    validate_cleanup_proof,
+    _trigger_recompute_epoch_fenced,
+)
 from prism_serve.scheduler.queue import NATSQueue
-from prism_serve.scheduler.scheduler import PDScheduler
-from prism_serve.scheduler.sequence_state import RequestInfo, RequestTracker, SeqState
+from prism_serve.scheduler.scheduler import KVUsageSample, PDScheduler
+from prism_serve.scheduler.sequence_state import (
+    RequestInfo, RequestTracker, SeqState, TransferTask,
+)
 from prism_serve.scheduler.transfer_governor import TransferGovernor
 
 
@@ -30,7 +43,136 @@ DEFAULT_CONFIG = {
     "schedule_loop_tick_ms":  0,
 }
 
-KV_SIZE_1BLOCK = 28 * 1024 ** 2   # TP=1 reference block: 28 MiB
+KV_SIZE_1BLOCK = 28 * 1024 ** 2   # TP=1 illustrative block: 28 MiB
+
+
+REACHABLE_CLEANUP_DOMAIN = [
+    (SeqState.WAITING, RemoteRequestState.NOT_OWNED,
+     RemoteRequestState.NEVER_DISPATCHED, TransferCleanupState.NONE,
+     "none", "NOT_STARTED", True, False),
+]
+REACHABLE_CLEANUP_DOMAIN += [
+    (SeqState.PREFILLING, p_state, RemoteRequestState.NEVER_DISPATCHED,
+     TransferCleanupState.NONE, "none", outcome, p_safe, True)
+    for outcome, p_states in [
+        ("NOT_STARTED", [(RemoteRequestState.NEVER_DISPATCHED, True)]),
+        ("ACKED", [(RemoteRequestState.ABORT_ACK, True),
+                   (RemoteRequestState.UNCERTAIN, False)]),
+        ("UNKNOWN", [(RemoteRequestState.NEVER_DISPATCHED, False),
+                     (RemoteRequestState.ABORT_ACK, False),
+                     (RemoteRequestState.UNCERTAIN, False)]),
+    ]
+    for p_state, p_safe in p_states
+]
+REACHABLE_CLEANUP_DOMAIN += [
+    (SeqState.KV_PENDING, RemoteRequestState.ALREADY_COMPLETED, d_state,
+     transfer_state, mode, "ACKED", True,
+     d_state == RemoteRequestState.ABORT_ACK
+     and transfer_state != TransferCleanupState.UNCERTAIN)
+    for mode, transfer_states in [
+        ("deferred", [TransferCleanupState.DEFERRED_CANCELLED]),
+        ("inflight", [TransferCleanupState.FENCED_ACK,
+                      TransferCleanupState.UNCERTAIN]),
+    ]
+    for d_state in [RemoteRequestState.ABORT_ACK, RemoteRequestState.UNCERTAIN]
+    for transfer_state in transfer_states
+]
+REACHABLE_CLEANUP_DOMAIN += [
+    (state, RemoteRequestState.ALREADY_COMPLETED, d_state, transfer_state,
+     "none", "ACKED", True, d_state == RemoteRequestState.ABORT_ACK)
+    for state, transfer_state in [
+        (SeqState.DECODING, TransferCleanupState.NONE),
+        (SeqState.RECOMPUTING, TransferCleanupState.FENCED_ACK),
+    ]
+    for d_state in [RemoteRequestState.ABORT_ACK, RemoteRequestState.UNCERTAIN]
+]
+
+
+@pytest.mark.parametrize(
+    ("state", "p_state", "d_state", "transfer_state", "mode", "outcome",
+     "p_safe", "d_safe"),
+    REACHABLE_CLEANUP_DOMAIN,
+)
+def test_cleanup_proof_exhaustive_reachable_domain(
+    state, p_state, d_state, transfer_state, mode, outcome, p_safe, d_safe,
+):
+    proof = CleanupProof(
+        request_state=state,
+        p_remote_request_state=p_state,
+        d_remote_request_state=d_state,
+        transfer_state=transfer_state,
+        transfer_mode=mode,
+        publish_outcome=outcome,
+        request_owns_p_load=state == SeqState.PREFILLING,
+        request_owns_original_d_slot=state != SeqState.WAITING,
+    )
+    validate_cleanup_proof(proof)
+    assert p_load_releasable(proof) is p_safe
+    assert d_slot_releasable(proof) is d_safe
+
+
+def test_cleanup_proof_rejects_na_transfer_combination():
+    proof = CleanupProof(
+        request_state=SeqState.DECODING,
+        p_remote_request_state=RemoteRequestState.ALREADY_COMPLETED,
+        d_remote_request_state=RemoteRequestState.ABORT_ACK,
+        transfer_state=TransferCleanupState.FENCED_ACK,
+        transfer_mode="inflight",
+        publish_outcome="ACKED",
+        request_owns_p_load=False,
+        request_owns_original_d_slot=True,
+    )
+    with pytest.raises(ValueError, match="invalid cleanup proof"):
+        validate_cleanup_proof(proof)
+
+
+@pytest.mark.asyncio
+async def test_epoch_switch_during_recompute_trigger_is_local_only():
+    scheduler, governor, _, _, _, _ = make_components()
+    scheduler.register_instance("d-0", "decode", max_slots=1, instance_epoch="e1")
+    req = RequestInfo(
+        req_id="R1", state=SeqState.KV_PENDING,
+        decode_instance="d-0", decode_instance_epoch="e1",
+    )
+
+    def flip(_req_id, _dst):
+        record = scheduler.quarantine_instance("d-0")
+        scheduler.reconcile_instance(
+            "d-0", "e2", record.reconciliation_token, "decode", 1,
+            [], [], [],
+        )
+
+    governor.trigger_recompute = MagicMock(side_effect=flip)
+    assert not await _trigger_recompute_epoch_fenced(req, scheduler, governor)
+    assert req.state == SeqState.KV_PENDING
+    assert scheduler.decode_free_slots()["d-0"] == 1
+    assert scheduler.quarantine_record("d-0") is None
+
+
+@pytest.mark.asyncio
+async def test_epoch_switch_during_recompute_retry_is_local_only():
+    scheduler, governor, _, _, _, _ = make_components()
+    scheduler.register_instance("d-0", "decode", max_slots=1, instance_epoch="e1")
+    started = time.monotonic() - 1.0
+    req = RequestInfo(
+        req_id="R1", state=SeqState.RECOMPUTING,
+        decode_instance="d-0", decode_instance_epoch="e1",
+        recompute_start=started,
+    )
+
+    async def flip(_req_id, _dst):
+        await asyncio.sleep(0)
+        record = scheduler.quarantine_instance("d-0")
+        scheduler.reconcile_instance(
+            "d-0", "e2", record.reconciliation_token, "decode", 1,
+            [], [], [],
+        )
+
+    governor.trigger_recompute = MagicMock(side_effect=flip)
+    assert not await _trigger_recompute_epoch_fenced(req, scheduler, governor)
+    assert req.state == SeqState.RECOMPUTING
+    assert req.recompute_start == started
+    assert scheduler.decode_free_slots()["d-0"] == 1
 
 
 def make_components(config: dict | None = None):
@@ -47,8 +189,40 @@ def make_components(config: dict | None = None):
 
     governor = TransferGovernor(cfg, infer_client, metrics)
     scheduler = PDScheduler(cfg)
+    original_register = scheduler.register_instance
+
+    def register_with_fresh_usage(*args, **kwargs):
+        original_register(*args, **kwargs)
+        instance_id = args[0]
+        role = args[1]
+        if role == "decode":
+            epoch = scheduler.instance_epoch(instance_id)
+            sample = KVUsageSample(0.0, epoch, time.monotonic())
+            scheduler.update_kv_usage(instance_id, sample)
+            governor.set_expected_epochs(scheduler.decode_instance_epochs())
+            governor.update_kv_usage(instance_id, sample)
+
+    scheduler.register_instance = register_with_fresh_usage
     tracker = RequestTracker(metrics)
     queue = NATSQueue(cfg, use_mock=True)
+    original_put_mock = queue._put_mock
+
+    async def put_with_epoch(subject: str, data: dict) -> None:
+        payload = dict(data)
+        request = tracker.get(payload.get("req_id", ""))
+        if subject == "prefill_done":
+            payload.setdefault(
+                "instance_epoch",
+                request.prefill_instance_epoch if request is not None else "",
+            )
+        elif subject in {"recompute_done", "first_token", "decode_done"}:
+            payload.setdefault(
+                "instance_epoch",
+                request.decode_instance_epoch if request is not None else "",
+            )
+        await original_put_mock(subject, payload)
+
+    queue._put_mock = put_with_epoch
     return scheduler, governor, tracker, queue, metrics, infer_client
 
 
@@ -283,7 +457,9 @@ async def test_kv_transfer_deferred_then_flushed():
     scheduler.register_instance("p-0", "prefill")
     scheduler.register_instance("d-0", "decode", max_slots=10)
 
-    governor._kv_usage["d-0"] = 0.90
+    # Set D congested before prefill_done arrives
+    sample = KVUsageSample(0.90, "legacy:d-0", time.monotonic())
+    governor.update_kv_usage("d-0", sample)
 
     infer_client.transfer.side_effect = (
         lambda src, dst, req_id, operation_id, on_complete=None:
@@ -322,7 +498,9 @@ async def test_kv_transfer_deferred_then_flushed():
             assert governor.deferred_depth("d-0") == 1
             assert infer_client.transfer.call_count == 0
 
-            governor.update_kv_usage("d-0", 0.60)
+            # Simulate watermark drop → governor should flush
+            sample = KVUsageSample(0.60, "legacy:d-0", time.monotonic())
+            governor.update_kv_usage("d-0", sample)
 
         if tick == 30:
             assert infer_client.transfer.call_count == 1
@@ -407,6 +585,7 @@ async def test_recompute_fallback_on_timeout():
 
 @pytest.mark.asyncio
 async def test_transfer_abort_failure_quarantines_before_recompute():
+    """Unknown remote writes must quarantine D instead of starting recompute."""
     config = {**DEFAULT_CONFIG, "kv_transfer_timeout_s": 0.01}
     scheduler, governor, tracker, queue, metrics, infer_client = make_components(config)
     scheduler.register_instance("p-0", "prefill")
@@ -445,6 +624,7 @@ async def test_transfer_abort_failure_quarantines_before_recompute():
 
 @pytest.mark.asyncio
 async def test_late_completion_during_transfer_abort_await_wins_once():
+    """A completion committed during abort must stop fallback."""
     config = {**DEFAULT_CONFIG, "kv_transfer_timeout_s": 0.01}
     scheduler, governor, tracker, queue, metrics, infer_client = make_components(config)
     scheduler.register_instance("p-0", "prefill")
@@ -468,16 +648,16 @@ async def test_late_completion_during_transfer_abort_await_wins_once():
     try:
         for _ in range(200):
             await asyncio.sleep(0)
-            request = tracker.get("R1")
-            if request and request.state == SeqState.PREFILLING and not prefill_injected:
+            req = tracker.get("R1")
+            if req and req.state == SeqState.PREFILLING and not prefill_injected:
                 await queue._put_mock("prefill_done", {
                     "req_id": "R1",
                     "kv_size_bytes": KV_SIZE_1BLOCK,
                     "block_table": [3],
                 })
                 prefill_injected = True
-            if request and request.state == SeqState.KV_PENDING:
-                request.kv_sent_at = time.monotonic() - 1.0
+            if req and req.state == SeqState.KV_PENDING:
+                req.kv_sent_at = time.monotonic() - 1.0
             if abort_started.is_set():
                 break
 
@@ -512,6 +692,7 @@ async def test_late_completion_during_transfer_abort_await_wins_once():
 
 @pytest.mark.asyncio
 async def test_transfer_ownership_loss_quarantines_and_terminates():
+    """Lost governor ownership must quarantine the bound decode instance."""
     config = {**DEFAULT_CONFIG, "kv_transfer_timeout_s": 0.01}
     scheduler, governor, tracker, queue, metrics, infer_client = make_components(config)
     scheduler.register_instance("p-0", "prefill")
@@ -526,20 +707,26 @@ async def test_transfer_ownership_loss_quarantines_and_terminates():
     try:
         for _ in range(200):
             await asyncio.sleep(0)
-            request = tracker.get("R1")
-            if request and request.state == SeqState.PREFILLING and not prefill_injected:
+            req = tracker.get("R1")
+            if req and req.state == SeqState.PREFILLING and not prefill_injected:
                 await queue._put_mock("prefill_done", {
                     "req_id": "R1",
                     "kv_size_bytes": KV_SIZE_1BLOCK,
                     "block_table": [3],
                 })
                 prefill_injected = True
-            if request and request.state == SeqState.KV_PENDING:
-                operation_id = request.transfer_operation_id
+            if req and req.state == SeqState.KV_PENDING:
+                operation_id = req.transfer_operation_id
                 assert governor.cancel("R1", operation_id)
-                request.kv_sent_at = time.monotonic() - 1.0
+                req.kv_sent_at = time.monotonic() - 1.0
+                break
+
+        for _ in range(100):
+            await asyncio.sleep(0)
             if "R1" not in tracker:
                 break
+
+        assert not task.done()
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -549,7 +736,7 @@ async def test_transfer_ownership_loss_quarantines_and_terminates():
     assert scheduler.quarantine_record("d-0") is not None
     assert "d-0" not in scheduler.decode_free_slots()
     assert governor.is_drained()
-    infer_client.abort_transfer.assert_not_called()
+    infer_client.abort_transfer.assert_not_awaited()
     infer_client.reset_to_waiting.assert_not_called()
 
 
@@ -816,6 +1003,8 @@ async def test_waiting_until_decode_slot_freed():
         if r2 and r2.state == SeqState.PREFILLING:
             break
 
+    r = tracker.get("R1")
+    assert r is not None and r.state == SeqState.PREFILLING
     loop_task.cancel()
     try:
         await loop_task
@@ -824,8 +1013,7 @@ async def test_waiting_until_decode_slot_freed():
 
     ml.TICK_INTERVAL_S = orig
 
-    r = tracker.get("R1")
-    assert r is not None and r.state == SeqState.PREFILLING
+    assert "R1" not in tracker
 
 
 @pytest.mark.asyncio
@@ -871,7 +1059,10 @@ def test_governor_kv_usage_update_unblocks_deferred():
     config = {**DEFAULT_CONFIG, "MAX_BYTES_INFLIGHT": 512 * 1024 ** 2}
     governor = TransferGovernor(config, infer_client, metrics)
 
-    governor._kv_usage["d-0"] = 0.90   # congested
+    governor.set_expected_epochs({"d-0": "e1"})
+    governor.update_kv_usage(
+        "d-0", KVUsageSample(0.90, "e1", time.monotonic())
+    )
     task = TransferTask(req_id="R1", src="p-0", dst="d-0", kv_size=KV_SIZE_1BLOCK)
     governor.submit(task)
 
@@ -879,7 +1070,9 @@ def test_governor_kv_usage_update_unblocks_deferred():
     infer_client.transfer.assert_not_called()
 
     # Watermark recovery
-    governor.update_kv_usage("d-0", 0.65)
+    governor.update_kv_usage(
+        "d-0", KVUsageSample(0.65, "e1", time.monotonic())
+    )
 
     assert governor.deferred_depth("d-0") == 0
     infer_client.transfer.assert_called_once()
@@ -979,7 +1172,8 @@ async def test_decode_timeout_releases_reserved_slot():
 
 
 @pytest.mark.asyncio
-async def test_dispatch_publish_failure_keeps_loop_alive_and_rolls_back():
+async def test_dispatch_publish_response_loss_quarantines_and_terminates():
+    """Publish failure after task creation is UNKNOWN, not safely retryable."""
     scheduler, governor, tracker, queue, metrics, _ = make_components()
     scheduler.register_instance("p-0", "prefill")
     scheduler.register_instance("d-0", "decode", max_slots=1)
@@ -999,29 +1193,59 @@ async def test_dispatch_publish_failure_keeps_loop_alive_and_rolls_back():
     try:
         for _ in range(100):
             await asyncio.sleep(0)
-            request = tracker.get("R1")
-            if request and request.state == SeqState.PREFILLING:
+            if calls == 1 and "R1" not in tracker:
                 break
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    assert calls >= 2
-    assert tracker.get("R1").state == SeqState.PREFILLING
-    assert scheduler.prefill_queue_depths() == {"p-0": 1}
-    assert scheduler.decode_free_slots() == {"d-0": 0}
+    assert calls == 1
+    assert "R1" not in tracker
+    assert scheduler.quarantine_record("p-0") is not None
+    assert scheduler.decode_free_slots() == {"d-0": 1}
+
+
+@pytest.mark.asyncio
+async def test_prefill_publish_cancelled_is_visible_to_shutdown():
+    scheduler, governor, tracker, queue, metrics, _ = make_components()
+    scheduler.register_instance("p-0", "prefill")
+    scheduler.register_instance("d-0", "decode", max_slots=1)
+    tracker.add(RequestInfo(req_id="R1", kv_size_bytes=KV_SIZE_1BLOCK))
+    entered = asyncio.Event()
+
+    async def blocked_publish(_subject, _data):
+        entered.set()
+        await asyncio.Event().wait()
+
+    queue.publish = blocked_publish
+    task = asyncio.create_task(
+        schedule_loop(scheduler, governor, tracker, queue, metrics, DEFAULT_CONFIG)
+    )
+    await asyncio.wait_for(entered.wait(), 1.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    await _abort_remaining_requests(
+        tracker, scheduler, governor, queue.owner_id, 0.1, 0.1,
+    )
+    assert "R1" not in tracker
+    assert scheduler.quarantine_record("p-0") is not None
+    assert scheduler.decode_free_slots()["d-0"] == 1
 
 
 @pytest.mark.asyncio
 async def test_decode_abort_failure_quarantines_instance_capacity():
+    """Unconfirmed remote abort must remove the D instance from scheduling."""
     config = {**DEFAULT_CONFIG, "decode_timeout_s": 0.01}
     scheduler, governor, tracker, queue, metrics, infer_client = make_components(config)
     scheduler.register_instance("d-0", "decode", max_slots=1)
     scheduler._decode_free_slots["d-0"] = 0
     infer_client.abort_request.return_value = {"success": False}
     request = RequestInfo(
-        req_id="R1", state=SeqState.DECODING, decode_instance="d-0"
+        req_id="R1", state=SeqState.DECODING, decode_instance="d-0",
+        decode_instance_epoch=scheduler.instance_epoch("d-0"),
     )
     request.decode_start = time.monotonic() - 1.0
     tracker.add(request)
@@ -1041,3 +1265,179 @@ async def test_decode_abort_failure_quarantines_instance_capacity():
 
     assert "R1" not in tracker
     assert "d-0" not in scheduler.decode_free_slots()
+    assert scheduler.quarantine_record("d-0") is not None
+
+
+@pytest.mark.asyncio
+async def test_old_epoch_decode_done_and_timeout_cannot_mutate_reconciled_capacity():
+    """e1 late paths must not release or quarantine slots rebuilt for e2."""
+    scheduler, governor, tracker, queue, metrics, infer_client = make_components({
+        "decode_timeout_s": 0.01,
+    })
+    scheduler.register_instance("d-0", "decode", max_slots=2, instance_epoch="e1")
+    record = scheduler.quarantine_instance("d-0")
+    scheduler.reconcile_instance(
+        "d-0", "e2", record.reconciliation_token, "decode", 2, [], [],
+    )
+    sample = KVUsageSample(0.1, "e2", time.monotonic())
+    scheduler.update_kv_usage("d-0", sample)
+    governor.set_expected_epochs({"d-0": "e2"})
+    governor.update_kv_usage("d-0", sample)
+
+    assert scheduler.pick_decode_instance("new", 0) == "d-0"
+    tracker.add(RequestInfo(
+        req_id="old", state=SeqState.DECODING, decode_instance="d-0",
+        decode_instance_epoch="e1", decode_start=time.monotonic() - 1.0,
+    ))
+    tracker.add(RequestInfo(
+        req_id="new", state=SeqState.DECODING, decode_instance="d-0",
+        decode_instance_epoch="e2",
+    ))
+    await queue._put_mock("decode_done", {
+        "req_id": "old", "instance_epoch": "e1",
+    })
+    await queue._put_mock("decode_done", {
+        "req_id": "new", "instance_epoch": "e2",
+    })
+
+    task = asyncio.create_task(
+        schedule_loop(scheduler, governor, tracker, queue, metrics, {
+            **DEFAULT_CONFIG, "decode_timeout_s": 0.01,
+        })
+    )
+    try:
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if len(tracker) == 0:
+                break
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert scheduler.decode_free_slots()["d-0"] == 2
+    assert scheduler.quarantine_record("d-0") is None
+    infer_client.abort_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_e1_to_e2_kv_abort_await_cannot_trigger_recompute():
+    config = {**DEFAULT_CONFIG, "kv_transfer_timeout_s": 0.01}
+    scheduler, governor, tracker, queue, metrics, infer_client = make_components(config)
+    scheduler.register_instance("p-0", "prefill", instance_epoch="p-e1")
+    scheduler.register_instance("d-0", "decode", max_slots=1, instance_epoch="e1")
+    scheduler._decode_free_slots["d-0"] = 0
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def abort_transfer(**_kwargs):
+        entered.set()
+        await release.wait()
+        return {"success": True}
+
+    infer_client.abort_transfer = AsyncMock(side_effect=abort_transfer)
+    infer_client.transfer.side_effect = lambda **_kwargs: None
+    governor.submit(TransferTask(
+        req_id="R1", operation_id="op-e1", src="p-0", dst="d-0", kv_size=1,
+    ))
+    tracker.add(RequestInfo(
+        req_id="R1", state=SeqState.KV_PENDING,
+        prefill_instance="p-0", decode_instance="d-0",
+        prefill_instance_epoch="p-e1", decode_instance_epoch="e1",
+        transfer_operation_id="op-e1",
+        kv_sent_at=time.monotonic() - 1.0,
+    ))
+    task = asyncio.create_task(
+        schedule_loop(scheduler, governor, tracker, queue, metrics, config)
+    )
+    await asyncio.wait_for(entered.wait(), 1.0)
+    record = scheduler.quarantine_instance("d-0")
+    scheduler.reconcile_instance(
+        "d-0", "e2", record.reconciliation_token, "decode", 1, [], [], [],
+    )
+    release.set()
+    for _ in range(100):
+        await asyncio.sleep(0)
+        if "R1" not in tracker:
+            break
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert infer_client.reset_to_waiting.call_count == 0
+    assert scheduler.decode_free_slots()["d-0"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rpc_result", [True, False, "response_lost"])
+async def test_phase3_source_epoch_flip_quarantines_current_d(rpc_result):
+    config = {**DEFAULT_CONFIG, "kv_transfer_timeout_s": 0.01}
+    scheduler, governor, tracker, queue, metrics, infer_client = make_components(config)
+    scheduler.register_instance("p-0", "prefill", instance_epoch="p-e1")
+    scheduler.register_instance("d-0", "decode", max_slots=1, instance_epoch="d-e1")
+    scheduler._decode_free_slots["d-0"] = 0
+
+    async def flip_source(**_kwargs):
+        record = scheduler.quarantine_instance("p-0")
+        scheduler.reconcile_instance(
+            "p-0", "p-e2", record.reconciliation_token, "prefill", 0,
+            [], [], [],
+        )
+        if rpc_result == "response_lost":
+            raise ConnectionError("response lost after source flip")
+        return {"success": rpc_result}
+
+    infer_client.abort_transfer = AsyncMock(side_effect=flip_source)
+    infer_client.transfer.side_effect = lambda **_kwargs: None
+    governor.submit(TransferTask(
+        req_id="R1", operation_id="op", src="p-0", dst="d-0", kv_size=1,
+    ))
+    tracker.add(RequestInfo(
+        req_id="R1", state=SeqState.KV_PENDING,
+        prefill_instance="p-0", decode_instance="d-0",
+        prefill_instance_epoch="p-e1", decode_instance_epoch="d-e1",
+        transfer_operation_id="op", kv_sent_at=time.monotonic() - 1.0,
+    ))
+    task = asyncio.create_task(
+        schedule_loop(scheduler, governor, tracker, queue, metrics, config)
+    )
+    for _ in range(200):
+        await asyncio.sleep(0)
+        if "R1" not in tracker:
+            break
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    record = scheduler.quarantine_record("d-0")
+    assert record is not None
+    assert record.uncertain_transfer_operations == (
+        (queue.owner_id, "R1", "op", "d-e1"),
+    )
+    assert governor.is_drained()
+
+
+@pytest.mark.asyncio
+async def test_e1_to_e2_recompute_timeout_cannot_retry_or_mutate_e2():
+    config = {**DEFAULT_CONFIG, "recompute_timeout_s": 0.01}
+    scheduler, governor, tracker, queue, metrics, infer_client = make_components(config)
+    scheduler.register_instance("d-0", "decode", max_slots=1, instance_epoch="e1")
+    record = scheduler.quarantine_instance("d-0")
+    scheduler.reconcile_instance(
+        "d-0", "e2", record.reconciliation_token, "decode", 1, [], [], [],
+    )
+    tracker.add(RequestInfo(
+        req_id="R1", state=SeqState.RECOMPUTING,
+        decode_instance="d-0", decode_instance_epoch="e1",
+        recompute_start=time.monotonic() - 1.0,
+    ))
+    task = asyncio.create_task(
+        schedule_loop(scheduler, governor, tracker, queue, metrics, config)
+    )
+    for _ in range(100):
+        await asyncio.sleep(0)
+        if "R1" not in tracker:
+            break
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert infer_client.reset_to_waiting.call_count == 0
+    assert scheduler.decode_free_slots()["d-0"] == 1

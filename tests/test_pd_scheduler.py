@@ -1,6 +1,7 @@
 """Unit tests for PDScheduler (scheduler/scheduler.py)."""
+import time
 import pytest
-from prism_serve.scheduler.scheduler import PDScheduler
+from prism_serve.scheduler.scheduler import KVUsageSample, PDScheduler
 
 
 def make_scheduler(extra: dict | None = None) -> PDScheduler:
@@ -13,6 +14,15 @@ def make_scheduler(extra: dict | None = None) -> PDScheduler:
     if extra:
         config.update(extra)
     return PDScheduler(config)
+
+
+def _set_usage(scheduler: PDScheduler, instance_id: str, ratio: float) -> None:
+    scheduler.update_kv_usage(
+        instance_id,
+        KVUsageSample(
+            ratio, scheduler.instance_epoch(instance_id), time.monotonic()
+        ),
+    )
 
 
 # register_instance
@@ -29,7 +39,7 @@ def test_register_decode():
     sch.register_instance("d-0", "decode", max_slots=100)
     assert "d-0" in sch._decode_free_slots
     assert sch._decode_free_slots["d-0"] == 100
-    assert sch._kv_usage["d-0"] == 0.0
+    assert "d-0" not in sch._kv_usage
 
 
 def test_register_decode_no_slots_raises():
@@ -79,6 +89,20 @@ def test_quarantine_cannot_be_bypassed_by_registration():
     assert sch.quarantine_record("d-0") is None
 
 
+def test_prefill_unknown_reconciliation_requires_no_pending_dispatch():
+    sch = make_scheduler()
+    sch.register_instance("p-0", "prefill", instance_epoch="e1")
+    record = sch.quarantine_instance(
+        "p-0", uncertain_dispatch=("owner", "R1", "owner:R1", "e1")
+    )
+    with pytest.raises(ValueError, match="dispatch"):
+        sch.reconcile_instance(
+            "p-0", "e2", record.reconciliation_token, "prefill", 0, [], [],
+            ["owner:R1"],
+        )
+    assert sch.quarantine_record("p-0") is record
+
+
 # pick_prefill_instance
 
 def test_pick_prefill_shortest_queue():
@@ -111,6 +135,8 @@ def test_pick_decode_most_slots():
     sch.register_instance("d-1", "decode", max_slots=100)
     sch._decode_free_slots["d-0"] = 50
     sch._decode_free_slots["d-1"] = 80
+    _set_usage(sch, "d-0", 0.50)
+    _set_usage(sch, "d-1", 0.50)
     result = sch.pick_decode_instance("req-1", kv_size_bytes=0)
     assert result == "d-1"
 
@@ -118,6 +144,7 @@ def test_pick_decode_most_slots():
 def test_pick_decode_decrements_slot():
     sch = make_scheduler()
     sch.register_instance("d-0", "decode", max_slots=100)
+    _set_usage(sch, "d-0", 0.50)
     sch.pick_decode_instance("req-1", kv_size_bytes=0)
     assert sch._decode_free_slots["d-0"] == 99
 
@@ -126,8 +153,8 @@ def test_pick_decode_excludes_congested():
     sch = make_scheduler()
     sch.register_instance("d-0", "decode", max_slots=100)
     sch.register_instance("d-1", "decode", max_slots=100)
-    sch._kv_usage["d-0"] = 0.90   # above HIGH_WATERMARK
-    sch._kv_usage["d-1"] = 0.50
+    _set_usage(sch, "d-0", 0.90)
+    _set_usage(sch, "d-1", 0.50)
     result = sch.pick_decode_instance("req-1", kv_size_bytes=0)
     assert result == "d-1"
 
@@ -143,9 +170,25 @@ def test_pick_decode_excludes_full():
 def test_pick_decode_all_congested_returns_none():
     sch = make_scheduler()
     sch.register_instance("d-0", "decode", max_slots=100)
-    sch._kv_usage["d-0"] = 0.90
+    _set_usage(sch, "d-0", 0.90)
     result = sch.pick_decode_instance("req-1", kv_size_bytes=0)
     assert result is None
+
+
+def test_kv_usage_unknown_and_stale_fail_closed():
+    sch = make_scheduler({"kv_usage_stale_after_s": 1.0})
+    sch.register_instance("d-0", "decode", max_slots=1, instance_epoch="e1")
+    assert sch.pick_decode_instance("unknown", 0) is None
+
+    sch.update_kv_usage("d-0", KVUsageSample(0.1, "e1", time.monotonic() - 2.0))
+    assert sch.pick_decode_instance("stale", 0) is None
+
+
+def test_kv_usage_epoch_change_requires_new_sample():
+    sch = make_scheduler()
+    sch.register_instance("d-0", "decode", max_slots=1, instance_epoch="e1")
+    sch.update_kv_usage("d-0", KVUsageSample(0.1, "e0", time.monotonic()))
+    assert sch.pick_decode_instance("old-epoch", 0) is None
 
 
 # Feedback callbacks
@@ -177,10 +220,10 @@ def test_on_decode_finished_increments():
 def test_update_kv_usage_clamps():
     sch = make_scheduler()
     sch.register_instance("d-0", "decode", max_slots=100)
-    sch.update_kv_usage("d-0", 1.5)   # above 1.0
-    assert sch._kv_usage["d-0"] == 1.0
-    sch.update_kv_usage("d-0", -0.1)  # below 0.0
-    assert sch._kv_usage["d-0"] == 0.0
+    _set_usage(sch, "d-0", 1.5)
+    assert sch._kv_usage["d-0"].ratio == 1.0
+    _set_usage(sch, "d-0", -0.1)
+    assert sch._kv_usage["d-0"].ratio == 0.0
 
 
 # decide_decode_instance_count (← Flink AdaptiveBatch)

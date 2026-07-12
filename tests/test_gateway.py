@@ -153,6 +153,521 @@ async def test_shutdown_abort_cleans_remaining_request():
     assert governor.all_inflight_zero()
 
 
+@pytest.mark.asyncio
+async def test_shutdown_abort_transfer_response_lost_quarantines_d():
+    """A decode abort ACK cannot replace an operation-scoped transfer fence."""
+    import time
+
+    from prism_serve.metrics.collector import NullMetrics
+    from prism_serve.scheduler.scheduler import KVUsageSample, PDScheduler
+    from prism_serve.scheduler.sequence_state import (
+        RequestInfo, RequestTracker, SeqState, TransferTask,
+    )
+    from prism_serve.scheduler.transfer_governor import TransferGovernor
+
+    client = MagicMock()
+    client.transfer = MagicMock()
+    client.abort_request = AsyncMock(return_value={"success": True})
+    client.abort_transfer = AsyncMock(side_effect=asyncio.TimeoutError)
+    scheduler = PDScheduler({})
+    scheduler.register_instance("p-0", "prefill", instance_epoch="p-e1")
+    scheduler.register_instance("d-0", "decode", max_slots=1, instance_epoch="e1")
+    sample = KVUsageSample(0.1, "e1", time.monotonic())
+    scheduler.update_kv_usage("d-0", sample)
+    scheduler.pick_decode_instance("R1", 0)
+    governor = TransferGovernor({}, client, NullMetrics())
+    governor.set_expected_epochs({"d-0": "e1"})
+    governor.update_kv_usage("d-0", sample)
+    governor.submit(TransferTask(
+        req_id="R1", operation_id="op-1", src="p-0", dst="d-0", kv_size=1,
+    ))
+    late_completion = client.transfer.call_args.kwargs["on_complete"]
+    tracker = RequestTracker(NullMetrics())
+    tracker.add(RequestInfo(
+        req_id="R1", state=SeqState.KV_PENDING,
+            prefill_instance="p-0", decode_instance="d-0",
+            prefill_instance_epoch="p-e1", decode_instance_epoch="e1",
+            transfer_operation_id="op-1",
+    ))
+
+    await _abort_remaining_requests(
+        tracker, scheduler, governor, "owner-1", timeout_s=0.01,
+        transfer_timeout_s=0.01,
+    )
+
+    record = scheduler.quarantine_record("d-0")
+    assert record is not None
+    assert record.uncertain_transfer_operations == (
+        ("owner-1", "R1", "op-1", "e1"),
+    )
+    assert "d-0" not in scheduler.decode_free_slots()
+    assert governor.is_drained()
+    late_completion()
+    assert "d-0" not in scheduler.decode_free_slots()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_inflight_fence_and_d_ack_release_slot():
+    import time
+
+    from prism_serve.metrics.collector import NullMetrics
+    from prism_serve.scheduler.scheduler import KVUsageSample, PDScheduler
+    from prism_serve.scheduler.sequence_state import (
+        RequestInfo, RequestTracker, SeqState, TransferTask,
+    )
+    from prism_serve.scheduler.transfer_governor import TransferGovernor
+
+    client = MagicMock()
+    client.transfer = MagicMock()
+    client.abort_request = AsyncMock(return_value={"success": True})
+    client.abort_transfer = AsyncMock(return_value={"success": True})
+    scheduler = PDScheduler({})
+    scheduler.register_instance("p-0", "prefill", instance_epoch="p-e1")
+    scheduler.register_instance("d-0", "decode", max_slots=1, instance_epoch="e1")
+    sample = KVUsageSample(0.1, "e1", time.monotonic())
+    scheduler.update_kv_usage("d-0", sample)
+    scheduler.pick_decode_instance("R1", 0)
+    governor = TransferGovernor({}, client, NullMetrics())
+    governor.set_expected_epochs({"d-0": "e1"})
+    governor.update_kv_usage("d-0", sample)
+    governor.submit(TransferTask(
+        req_id="R1", operation_id="op-1", src="p-0", dst="d-0", kv_size=1,
+    ))
+    tracker = RequestTracker(NullMetrics())
+    tracker.add(RequestInfo(
+        req_id="R1", state=SeqState.KV_PENDING,
+            prefill_instance="p-0", decode_instance="d-0",
+            prefill_instance_epoch="p-e1", decode_instance_epoch="e1",
+            transfer_operation_id="op-1",
+    ))
+
+    await _abort_remaining_requests(
+        tracker, scheduler, governor, "owner-1", timeout_s=0.1,
+        transfer_timeout_s=0.1,
+    )
+
+    assert scheduler.decode_free_slots()["d-0"] == 1
+    assert scheduler.quarantine_record("d-0") is None
+    client.abort_transfer.assert_awaited_once()
+
+
+async def _run_named_shutdown_case(
+    state,
+    *,
+    p_ack: bool = True,
+    d_ack: bool = True,
+    transfer_ack: bool = True,
+    transfer_mode: str = "none",
+):
+    import time
+
+    from prism_serve.metrics.collector import NullMetrics
+    from prism_serve.scheduler.scheduler import KVUsageSample, PDScheduler
+    from prism_serve.scheduler.sequence_state import RequestInfo, RequestTracker, TransferTask
+    from prism_serve.scheduler.transfer_governor import TransferGovernor
+
+    client = MagicMock()
+    client.transfer = MagicMock()
+
+    async def abort_request(instance_id, **_kwargs):
+        return {"success": p_ack if instance_id == "p-0" else d_ack}
+
+    client.abort_request = AsyncMock(side_effect=abort_request)
+    client.abort_transfer = AsyncMock(return_value={"success": transfer_ack})
+    scheduler = PDScheduler({})
+    scheduler.register_instance("p-0", "prefill", instance_epoch="p-e1")
+    scheduler.register_instance("d-0", "decode", max_slots=1, instance_epoch="d-e1")
+    sample = KVUsageSample(0.1, "d-e1", time.monotonic())
+    scheduler.update_kv_usage("d-0", sample)
+    scheduler.pick_prefill_instance("R1")
+    scheduler.pick_decode_instance("R1", 0)
+    governor = TransferGovernor({}, client, NullMetrics())
+    governor.set_expected_epochs({"d-0": "d-e1"})
+    governor.update_kv_usage("d-0", sample)
+    if state.name != "PREFILLING":
+        scheduler.on_prefill_done("p-0", "p-e1")
+    if transfer_mode != "none":
+        if transfer_mode == "deferred":
+            governor.update_kv_usage(
+                "d-0", KVUsageSample(0.9, "d-e1", time.monotonic())
+            )
+        governor.submit(TransferTask(
+            req_id="R1", operation_id="op-1", src="p-0", dst="d-0", kv_size=1,
+        ))
+    tracker = RequestTracker(NullMetrics())
+    tracker.add(RequestInfo(
+        req_id="R1", state=state, prefill_instance="p-0",
+        decode_instance="d-0", prefill_instance_epoch="p-e1",
+        decode_instance_epoch="d-e1", transfer_operation_id="op-1",
+        publish_outcome="ACKED" if state.name == "PREFILLING" else "NOT_STARTED",
+    ))
+    await _abort_remaining_requests(
+        tracker, scheduler, governor, "owner", 0.1, 0.1,
+    )
+    return scheduler, client
+
+
+@pytest.mark.asyncio
+async def test_shutdown_prefilling_p_ack_releases_both_local_reservations():
+    from prism_serve.scheduler.sequence_state import SeqState
+    scheduler, _ = await _run_named_shutdown_case(SeqState.PREFILLING)
+    assert scheduler.prefill_queue_depths()["p-0"] == 0
+    assert scheduler.decode_free_slots()["d-0"] == 1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_prefilling_p_timeout_only_quarantines_p():
+    from prism_serve.scheduler.sequence_state import SeqState
+    scheduler, _ = await _run_named_shutdown_case(SeqState.PREFILLING, p_ack=False)
+    assert scheduler.quarantine_record("p-0") is not None
+    assert scheduler.decode_free_slots()["d-0"] == 1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_deferred_p_success_d_timeout():
+    from prism_serve.scheduler.sequence_state import SeqState
+    scheduler, _ = await _run_named_shutdown_case(
+        SeqState.KV_PENDING, d_ack=False, transfer_mode="deferred",
+    )
+    assert scheduler.quarantine_record("d-0") is not None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_deferred_p_timeout_d_success():
+    from prism_serve.scheduler.sequence_state import SeqState
+    scheduler, _ = await _run_named_shutdown_case(
+        SeqState.KV_PENDING, p_ack=False, transfer_mode="deferred",
+    )
+    assert scheduler.decode_free_slots()["d-0"] == 1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_inflight_p_success_d_timeout():
+    from prism_serve.scheduler.sequence_state import SeqState
+    scheduler, _ = await _run_named_shutdown_case(
+        SeqState.KV_PENDING, d_ack=False, transfer_mode="inflight",
+    )
+    assert scheduler.quarantine_record("d-0") is not None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_d_timeout_transfer_ack_quarantines_d():
+    from prism_serve.scheduler.sequence_state import SeqState
+    scheduler, client = await _run_named_shutdown_case(
+        SeqState.KV_PENDING, d_ack=False, transfer_mode="inflight",
+    )
+    client.abort_transfer.assert_awaited_once()
+    assert scheduler.quarantine_record("d-0") is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state_name", ["DECODING", "RECOMPUTING"])
+async def test_shutdown_committed_d_ack_releases(state_name):
+    from prism_serve.scheduler.sequence_state import SeqState
+    scheduler, _ = await _run_named_shutdown_case(SeqState[state_name])
+    assert scheduler.decode_free_slots()["d-0"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state_name", ["DECODING", "RECOMPUTING"])
+async def test_shutdown_committed_d_timeout_quarantines_d(state_name):
+    from prism_serve.scheduler.sequence_state import SeqState
+    scheduler, _ = await _run_named_shutdown_case(SeqState[state_name], d_ack=False)
+    assert scheduler.quarantine_record("d-0") is not None
+
+
+@pytest.mark.asyncio
+async def test_unknown_publish_quarantines_before_blocked_abort():
+    import time
+
+    from prism_serve.metrics.collector import NullMetrics
+    from prism_serve.scheduler.scheduler import KVUsageSample, PDScheduler
+    from prism_serve.scheduler.sequence_state import RequestInfo, RequestTracker, SeqState
+    from prism_serve.scheduler.transfer_governor import TransferGovernor
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_abort(**_kwargs):
+        entered.set()
+        await release.wait()
+        return {"success": False}
+
+    client = MagicMock()
+    client.abort_request = AsyncMock(side_effect=blocked_abort)
+    scheduler = PDScheduler({})
+    scheduler.register_instance("p-0", "prefill", instance_epoch="p-e1")
+    scheduler.register_instance("d-0", "decode", max_slots=1, instance_epoch="d-e1")
+    sample = KVUsageSample(0.1, "d-e1", time.monotonic())
+    scheduler.update_kv_usage("d-0", sample)
+    scheduler.pick_prefill_instance("R1")
+    scheduler.pick_decode_instance("R1", 0)
+    governor = TransferGovernor({}, client, NullMetrics())
+    tracker = RequestTracker(NullMetrics())
+    tracker.add(RequestInfo(
+        req_id="R1", state=SeqState.PREFILLING,
+        prefill_instance="p-0", decode_instance="d-0",
+        prefill_instance_epoch="p-e1", decode_instance_epoch="d-e1",
+        command_id="owner:R1", publish_outcome="UNKNOWN",
+    ))
+
+    cleanup = asyncio.create_task(_abort_remaining_requests(
+        tracker, scheduler, governor, "owner", 1.0, 1.0,
+    ))
+    await asyncio.wait_for(entered.wait(), 1.0)
+    record = scheduler.quarantine_record("p-0")
+    assert record is not None
+    assert record.uncertain_dispatch_commands == (
+        ("owner", "R1", "owner:R1", "p-e1"),
+    )
+    assert scheduler.pick_prefill_instance("late") is None
+    assert scheduler.decode_free_slots()["d-0"] == 1
+    release.set()
+    await cleanup
+
+
+@pytest.mark.asyncio
+async def test_late_publish_after_ack_not_found_isolated():
+    """ACK_NOT_FOUND is modeled as abort failure; quarantine remains authoritative."""
+    await test_unknown_publish_quarantines_before_blocked_abort()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_creator_cancelled_lifespan_joins_same_task():
+    from prism_serve.scheduler.main_loop import _get_or_create_canonical_cleanup
+    from prism_serve.scheduler.sequence_state import SeqState
+
+    scheduler, client = await _run_named_shutdown_case(SeqState.PREFILLING)
+    # The helper completed terminal cleanup; exercise CAS identity independently.
+    from prism_serve.metrics.collector import NullMetrics
+    from prism_serve.scheduler.sequence_state import RequestInfo, RequestTracker
+    from prism_serve.scheduler.transfer_governor import TransferGovernor
+
+    gate = asyncio.Event()
+    client = MagicMock()
+
+    async def blocked_abort(**_kwargs):
+        await gate.wait()
+        return {"success": True}
+
+    client.abort_request = AsyncMock(side_effect=blocked_abort)
+    tracker = RequestTracker(NullMetrics())
+    scheduler.pick_prefill_instance("R2")
+    scheduler.pick_decode_instance("R2", 0)
+    req = RequestInfo(
+        req_id="R2", state=SeqState.PREFILLING,
+        prefill_instance="p-0", decode_instance="d-0",
+        prefill_instance_epoch="p-e1", decode_instance_epoch="d-e1",
+        publish_outcome="ACKED",
+    )
+    tracker.add(req)
+    governor = TransferGovernor({}, client, NullMetrics())
+    first = _get_or_create_canonical_cleanup(
+        req, tracker, scheduler, governor, "owner", 1.0, 1.0,
+    )
+    second = _get_or_create_canonical_cleanup(
+        req, tracker, scheduler, governor, "owner", 1.0, 1.0,
+    )
+    assert first is second
+    async def join():
+        await asyncio.shield(first)
+
+    waiter = asyncio.create_task(join())
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert not first.cancelled()
+    gate.set()
+    await _abort_remaining_requests(tracker, scheduler, governor, "owner", 1.0, 1.0)
+    assert first.done()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rpc_result", [True, False, "response_lost"])
+async def test_epoch_flip_during_p_abort_discards_result(rpc_result):
+    import time
+    from prism_serve.metrics.collector import NullMetrics
+    from prism_serve.scheduler.main_loop import _fence_and_abort_request
+    from prism_serve.scheduler.scheduler import KVUsageSample, PDScheduler
+    from prism_serve.scheduler.sequence_state import RequestInfo, SeqState
+    from prism_serve.scheduler.transfer_governor import TransferGovernor
+
+    scheduler = PDScheduler({})
+    scheduler.register_instance("p-0", "prefill", instance_epoch="p-e1")
+    scheduler.register_instance("d-0", "decode", max_slots=1, instance_epoch="d-e1")
+    sample = KVUsageSample(0.1, "d-e1", time.monotonic())
+    scheduler.update_kv_usage("d-0", sample)
+    scheduler.pick_prefill_instance("R1")
+    scheduler.pick_decode_instance("R1", 0)
+    client = MagicMock()
+
+    async def flip_p(**_kwargs):
+        record = scheduler.quarantine_instance("p-0")
+        scheduler.reconcile_instance(
+            "p-0", "p-e2", record.reconciliation_token, "prefill", 0,
+            [], [], [],
+        )
+        if rpc_result == "response_lost":
+            raise ConnectionError("response lost after epoch flip")
+        return {"success": rpc_result}
+
+    client.abort_request = AsyncMock(side_effect=flip_p)
+    governor = TransferGovernor({}, client, NullMetrics())
+    req = RequestInfo(
+        req_id="R1", state=SeqState.PREFILLING,
+        prefill_instance="p-0", decode_instance="d-0",
+        prefill_instance_epoch="p-e1", decode_instance_epoch="d-e1",
+        publish_outcome="ACKED",
+    )
+    await _fence_and_abort_request(req, scheduler, governor, "owner", 0.1, 0.1)
+    assert scheduler.prefill_queue_depths()["p-0"] == 0
+    assert scheduler.decode_free_slots()["d-0"] == 1
+    assert scheduler.quarantine_record("p-0") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rpc_result", [True, False, "response_lost"])
+async def test_epoch_flip_during_transfer_abort_discards_result(rpc_result):
+    import time
+    from prism_serve.metrics.collector import NullMetrics
+    from prism_serve.scheduler.main_loop import _fence_and_abort_request
+    from prism_serve.scheduler.scheduler import KVUsageSample, PDScheduler
+    from prism_serve.scheduler.sequence_state import RequestInfo, SeqState, TransferTask
+    from prism_serve.scheduler.transfer_governor import TransferGovernor
+
+    scheduler = PDScheduler({})
+    scheduler.register_instance("p-0", "prefill", instance_epoch="p-e1")
+    scheduler.register_instance("d-0", "decode", max_slots=1, instance_epoch="d-e1")
+    sample = KVUsageSample(0.1, "d-e1", time.monotonic())
+    scheduler.update_kv_usage("d-0", sample)
+    scheduler.pick_decode_instance("R1", 0)
+    client = MagicMock()
+    client.transfer = MagicMock()
+
+    async def flip_d(**_kwargs):
+        record = scheduler.quarantine_instance("d-0")
+        scheduler.reconcile_instance(
+            "d-0", "d-e2", record.reconciliation_token, "decode", 1,
+            [], [], [],
+        )
+        if rpc_result == "response_lost":
+            raise ConnectionError("response lost after epoch flip")
+        return {"success": rpc_result}
+
+    client.abort_transfer = AsyncMock(side_effect=flip_d)
+    client.abort_request = AsyncMock(return_value={"success": True})
+    governor = TransferGovernor({}, client, NullMetrics())
+    governor.set_expected_epochs({"d-0": "d-e1"})
+    governor.update_kv_usage("d-0", sample)
+    governor.submit(TransferTask(
+        req_id="R1", operation_id="op", src="p-0", dst="d-0", kv_size=1,
+    ))
+    req = RequestInfo(
+        req_id="R1", state=SeqState.KV_PENDING,
+        prefill_instance="p-0", decode_instance="d-0",
+        prefill_instance_epoch="p-e1", decode_instance_epoch="d-e1",
+        transfer_operation_id="op",
+    )
+    await _fence_and_abort_request(req, scheduler, governor, "owner", 0.1, 0.1)
+    assert scheduler.decode_free_slots()["d-0"] == 1
+    assert scheduler.quarantine_record("d-0") is None
+    client.abort_request.assert_not_awaited()
+    assert governor.is_drained()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rpc_result", [True, False, "response_lost"])
+async def test_source_epoch_flip_during_transfer_abort_quarantines_d(rpc_result):
+    import time
+    from prism_serve.metrics.collector import NullMetrics
+    from prism_serve.scheduler.main_loop import _fence_and_abort_request
+    from prism_serve.scheduler.scheduler import KVUsageSample, PDScheduler
+    from prism_serve.scheduler.sequence_state import RequestInfo, SeqState, TransferTask
+    from prism_serve.scheduler.transfer_governor import TransferGovernor
+
+    scheduler = PDScheduler({})
+    scheduler.register_instance("p-0", "prefill", instance_epoch="p-e1")
+    scheduler.register_instance("d-0", "decode", max_slots=1, instance_epoch="d-e1")
+    sample = KVUsageSample(0.1, "d-e1", time.monotonic())
+    scheduler.update_kv_usage("d-0", sample)
+    scheduler.pick_decode_instance("R1", 0)
+    client = MagicMock()
+    client.transfer = MagicMock()
+
+    async def flip_p(**_kwargs):
+        record = scheduler.quarantine_instance("p-0")
+        scheduler.reconcile_instance(
+            "p-0", "p-e2", record.reconciliation_token, "prefill", 0,
+            [], [], [],
+        )
+        if rpc_result == "response_lost":
+            raise ConnectionError("response lost after source epoch flip")
+        return {"success": rpc_result}
+
+    client.abort_transfer = AsyncMock(side_effect=flip_p)
+    client.abort_request = AsyncMock(return_value={"success": True})
+    governor = TransferGovernor({}, client, NullMetrics())
+    governor.set_expected_epochs({"d-0": "d-e1"})
+    governor.update_kv_usage("d-0", sample)
+    governor.submit(TransferTask(
+        req_id="R1", operation_id="op", src="p-0", dst="d-0", kv_size=1,
+    ))
+    req = RequestInfo(
+        req_id="R1", state=SeqState.KV_PENDING,
+        prefill_instance="p-0", decode_instance="d-0",
+        prefill_instance_epoch="p-e1", decode_instance_epoch="d-e1",
+        transfer_operation_id="op",
+    )
+    await _fence_and_abort_request(req, scheduler, governor, "owner", 0.1, 0.1)
+    assert scheduler.instance_epoch("p-0") == "p-e2"
+    assert "d-0" not in scheduler.decode_free_slots()
+    record = scheduler.quarantine_record("d-0")
+    assert record is not None
+    assert record.uncertain_transfer_operations == (
+        ("owner", "R1", "op", "d-e1"),
+    )
+    client.abort_request.assert_not_awaited()
+    assert governor.is_drained()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rpc_result", [True, False, "response_lost"])
+async def test_epoch_flip_during_d_abort_discards_result(rpc_result):
+    import time
+    from prism_serve.metrics.collector import NullMetrics
+    from prism_serve.scheduler.main_loop import _fence_and_abort_request
+    from prism_serve.scheduler.scheduler import KVUsageSample, PDScheduler
+    from prism_serve.scheduler.sequence_state import RequestInfo, SeqState
+    from prism_serve.scheduler.transfer_governor import TransferGovernor
+
+    scheduler = PDScheduler({})
+    scheduler.register_instance("d-0", "decode", max_slots=1, instance_epoch="d-e1")
+    sample = KVUsageSample(0.1, "d-e1", time.monotonic())
+    scheduler.update_kv_usage("d-0", sample)
+    scheduler.pick_decode_instance("R1", 0)
+    client = MagicMock()
+
+    async def flip_d(**_kwargs):
+        record = scheduler.quarantine_instance("d-0")
+        scheduler.reconcile_instance(
+            "d-0", "d-e2", record.reconciliation_token, "decode", 1,
+            [], [], [],
+        )
+        if rpc_result == "response_lost":
+            raise ConnectionError("response lost after epoch flip")
+        return {"success": rpc_result}
+
+    client.abort_request = AsyncMock(side_effect=flip_d)
+    governor = TransferGovernor({}, client, NullMetrics())
+    req = RequestInfo(
+        req_id="R1", state=SeqState.DECODING,
+        decode_instance="d-0", decode_instance_epoch="d-e1",
+    )
+    await _fence_and_abort_request(req, scheduler, governor, "owner", 0.1, 0.1)
+    assert scheduler.decode_free_slots()["d-0"] == 1
+    assert scheduler.quarantine_record("d-0") is None
+
+
 def test_chat_completions_returns_501_when_ready():
     with sync_client() as client:
         r = client.post("/v1/chat/completions", json={})
@@ -295,20 +810,23 @@ def test_quarantined_instance_requires_reconciliation():
 
         app.state.governor.infer_client.get_reconciliation_report = MagicMock(
             side_effect=[
-                {
-                    "instance_id": "d-quarantine",
-                    "instance_epoch": "epoch-2",
-                    "challenge": record.reconciliation_token,
-                    "active_request_ids": ["stale-request"],
-                },
+            {
+                "instance_id": "d-quarantine",
+                "instance_epoch": "epoch-2",
+                "challenge": record.reconciliation_token,
+                "active_request_ids": ["stale-request"],
+                "active_transfer_operation_ids": [],
+                "pending_dispatch_command_ids": [],
+            },
                 {
                     "instance_id": "d-quarantine",
                     "instance_epoch": "epoch-2",
                     "challenge": record.reconciliation_token,
                     "active_request_ids": [],
+                    "active_transfer_operation_ids": [],
+                    "pending_dispatch_command_ids": [],
                 },
-            ]
-        )
+        ])
 
         active = client.post("/internal/reconcile_instance", json={
             "instance_id": "d-quarantine",
@@ -349,6 +867,8 @@ def test_reconciliation_rejects_unfenced_worker_report():
                 "instance_epoch": "wrong-epoch",
                 "challenge": record.reconciliation_token,
                 "active_request_ids": [],
+                "active_transfer_operation_ids": [],
+                "pending_dispatch_command_ids": [],
             }
         )
 
@@ -360,8 +880,8 @@ def test_reconciliation_rejects_unfenced_worker_report():
             "max_slots": 2,
         })
 
-        assert response.status_code == 400
-        assert app.state.scheduler.quarantine_record("d-fenced") is not None
+    assert response.status_code == 400
+    assert app.state.scheduler.quarantine_record("d-fenced") is not None
 
 
 def test_reconciliation_timeout_keeps_instance_quarantined(monkeypatch):

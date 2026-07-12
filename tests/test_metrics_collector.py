@@ -197,29 +197,42 @@ async def test_scrape_kv_usage_propagates_to_governor():
     mc = _make_collector_with_mock_prometheus()
     gov = MagicMock()
     mc.set_governor(gov)
+    scheduler = MagicMock()
+    scheduler.decode_instance_epochs.return_value = {"d-0": "e0", "d-1": "e1"}
+    mc.set_scheduler(scheduler)
 
     client = MagicMock()
-    client.get_kv_usage_all = AsyncMock(return_value={"d-0": 0.72, "d-1": 0.45})
+    client.get_kv_usage_all = AsyncMock(return_value={
+        "d-0": {"ratio": 0.72, "instance_epoch": "e0"},
+        "d-1": {"ratio": 0.45, "instance_epoch": "e1"},
+    })
     mc.set_infer_client(client)
 
     await mc._scrape_kv_usage()
 
-    gov.update_kv_usage.assert_any_call("d-0", 0.72)
-    gov.update_kv_usage.assert_any_call("d-1", 0.45)
+    first = gov.update_kv_usage.call_args_list[0].args[1]
+    second = gov.update_kv_usage.call_args_list[1].args[1]
+    assert (first.ratio, first.instance_epoch) == (0.72, "e0")
+    assert (second.ratio, second.instance_epoch) == (0.45, "e1")
+    assert first.sampled_at == second.sampled_at
 
 
 @pytest.mark.asyncio
 async def test_scrape_kv_usage_propagates_to_scheduler():
     mc = _make_collector_with_mock_prometheus()
     scheduler = MagicMock()
+    scheduler.decode_instance_epochs.return_value = {"d-0": "e0"}
     mc.set_scheduler(scheduler)
     client = MagicMock()
-    client.get_kv_usage_all = AsyncMock(return_value={"d-0": 0.91})
+    client.get_kv_usage_all = AsyncMock(return_value={
+        "d-0": {"ratio": 0.91, "instance_epoch": "e0"},
+    })
     mc.set_infer_client(client)
 
     await mc._scrape_kv_usage()
 
-    scheduler.update_kv_usage.assert_called_once_with("d-0", 0.91)
+    sample = scheduler.update_kv_usage.call_args.args[1]
+    assert (sample.ratio, sample.instance_epoch) == (0.91, "e0")
 
 
 @pytest.mark.asyncio
@@ -234,7 +247,48 @@ async def test_scrape_kv_usage_client_exception_is_swallowed():
     client = MagicMock()
     client.get_kv_usage_all = AsyncMock(side_effect=RuntimeError("network error"))
     mc.set_infer_client(client)
+    await mc._scrape_kv_usage()   # must not raise
+
+
+@pytest.mark.asyncio
+async def test_kv_usage_missing_invalidates_both_consumers():
+    mc = _make_collector_with_mock_prometheus()
+    scheduler = MagicMock()
+    scheduler.decode_instance_epochs.return_value = {"d-0": "e0", "d-1": "e1"}
+    governor = MagicMock()
+    client = MagicMock()
+    client.get_kv_usage_all = AsyncMock(return_value={
+        "d-0": {"ratio": 0.2, "instance_epoch": "e0"},
+    })
+    mc.set_scheduler(scheduler)
+    mc.set_governor(governor)
+    mc.set_infer_client(client)
+
     await mc._scrape_kv_usage()
+
+    scheduler.update_kv_usage.assert_any_call("d-1", None)
+    governor.update_kv_usage.assert_any_call("d-1", None)
+
+
+@pytest.mark.asyncio
+async def test_kv_usage_epoch_change_invalidates_both_consumers():
+    mc = _make_collector_with_mock_prometheus()
+    scheduler = MagicMock()
+    scheduler.decode_instance_epochs.return_value = {"d-0": "new"}
+    governor = MagicMock()
+    client = MagicMock()
+    client.get_kv_usage_all = AsyncMock(return_value={
+        "d-0": {"ratio": 0.1, "instance_epoch": "old"},
+    })
+    mc.set_scheduler(scheduler)
+    mc.set_governor(governor)
+    mc.set_infer_client(client)
+
+    await mc._scrape_kv_usage()
+
+    scheduler.update_kv_usage.assert_called_once_with("d-0", None)
+    governor.update_kv_usage.assert_called_once_with("d-0", None)
+
 
 
 @pytest.mark.asyncio

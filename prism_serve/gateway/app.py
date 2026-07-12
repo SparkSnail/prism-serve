@@ -112,6 +112,7 @@ async def lifespan(app: FastAPI):
             app.state.governor,
             app.state.queue.owner_id,
             timeout_s=config["abort_request_timeout_s"],
+            transfer_timeout_s=config["abort_transfer_timeout_s"],
         )
 
     await _drain_governor(app.state.governor, timeout_s=30.0)
@@ -240,6 +241,8 @@ async def reconcile_instance(request: Request) -> JSONResponse:
             role=body["role"],
             max_slots=body.get("max_slots", 0),
             active_request_ids=report["active_request_ids"],
+            active_transfer_operation_ids=report["active_transfer_operation_ids"],
+            pending_dispatch_command_ids=report["pending_dispatch_command_ids"],
         )
     except (KeyError, AssertionError, ValueError) as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
@@ -258,24 +261,26 @@ def _build_config() -> dict:
         "scheduler_id":             settings.gateway_pod_uid,
         "scheduler_generation":     settings.gateway_process_generation,
         "control_plane_replica_count": settings.control_plane_replica_count,
-        "HIGH_WATERMARK":           settings.high_watermark,
-        "LOW_WATERMARK":            settings.low_watermark,
-        "MAX_BYTES_INFLIGHT":       settings.max_bytes_inflight,
-        "kv_transfer_timeout_s":    settings.kv_transfer_timeout_s,
-        "prefill_timeout_s":        settings.prefill_timeout_s,
-        "max_dispatch_attempts":    settings.max_dispatch_attempts,
-        "recompute_timeout_s":      settings.recompute_timeout_s,
-        "decode_timeout_s":         settings.decode_timeout_s,
-        "abort_request_timeout_s":  settings.abort_request_timeout_s,
-        "reconciliation_timeout_s": settings.reconciliation_timeout_s,
-        "max_recompute_attempts":   settings.max_recompute_attempts,
-        "schedule_loop_tick_ms":    settings.schedule_loop_tick_ms,
-        "governor_tick_s":          settings.governor_tick_s,
-        "shutdown_drain_timeout_s": settings.shutdown_drain_timeout_s,
-        "slot_stale_timeout_s":     settings.slot_stale_timeout_s,
-        "min_decode_instances":     settings.min_decode_instances,
-        "max_decode_instances":     settings.max_decode_instances,
-        "kv_per_instance_bytes":    settings.kv_per_instance_bytes,
+        "HIGH_WATERMARK":             settings.high_watermark,
+        "LOW_WATERMARK":              settings.low_watermark,
+        "MAX_BYTES_INFLIGHT":         settings.max_bytes_inflight,
+        "kv_transfer_timeout_s":      settings.kv_transfer_timeout_s,
+        "abort_transfer_timeout_s":   settings.abort_transfer_timeout_s,
+        "kv_usage_stale_after_s":     settings.kv_usage_stale_after_s,
+        "prefill_timeout_s":          settings.prefill_timeout_s,
+        "max_dispatch_attempts":      settings.max_dispatch_attempts,
+        "recompute_timeout_s":        settings.recompute_timeout_s,
+        "decode_timeout_s":           settings.decode_timeout_s,
+        "abort_request_timeout_s":    settings.abort_request_timeout_s,
+        "reconciliation_timeout_s":   settings.reconciliation_timeout_s,
+        "max_recompute_attempts":     settings.max_recompute_attempts,
+        "schedule_loop_tick_ms":      settings.schedule_loop_tick_ms,
+        "governor_tick_s":            settings.governor_tick_s,
+        "shutdown_drain_timeout_s":   settings.shutdown_drain_timeout_s,
+        "slot_stale_timeout_s":       settings.slot_stale_timeout_s,
+        "min_decode_instances":       settings.min_decode_instances,
+        "max_decode_instances":       settings.max_decode_instances,
+        "kv_per_instance_bytes":      settings.kv_per_instance_bytes,
         "kv_usage_scrape_interval_s": settings.governor_tick_s,
     }
 
@@ -315,6 +320,8 @@ def _make_stub_infer_client():
                 "instance_epoch": instance_epoch,
                 "challenge": challenge,
                 "active_request_ids": [],
+                "active_transfer_operation_ids": [],
+                "pending_dispatch_command_ids": [],
             }
 
         async def get_kv_usage_all(self) -> dict:
@@ -352,8 +359,19 @@ async def _get_reconciliation_report(
         raise ValueError("reconciliation epoch mismatch")
     if report.get("challenge") != challenge:
         raise ValueError("reconciliation challenge mismatch")
-    if not isinstance(report.get("active_request_ids"), list):
+    active = report.get("active_request_ids")
+    if not isinstance(active, list):
         raise ValueError("reconciliation active_request_ids must be a list")
+    active_transfers = report.get("active_transfer_operation_ids")
+    if not isinstance(active_transfers, list):
+        raise ValueError(
+            "reconciliation active_transfer_operation_ids must be a list"
+        )
+    pending_dispatches = report.get("pending_dispatch_command_ids")
+    if not isinstance(pending_dispatches, list):
+        raise ValueError(
+            "reconciliation pending_dispatch_command_ids must be a list"
+        )
     return report
 
 
@@ -396,22 +414,20 @@ async def _abort_remaining_requests(
     governor,
     owner_id: str,
     timeout_s: float,
+    transfer_timeout_s: float | None = None,
 ) -> None:
-    """Abort requests left after graceful drain before closing NATS."""
-    from prism_serve.scheduler.main_loop import _abort_and_release
-    from prism_serve.scheduler.sequence_state import SeqState
+    """Abort all requests left after graceful drain before closing NATS."""
+    from prism_serve.scheduler.main_loop import _get_or_create_canonical_cleanup
 
-    for req in tracker.all_requests():
-        await _abort_and_release(
-            req,
-            scheduler,
-            governor,
-            owner_id,
-            timeout_s,
-            include_prefill=req.state in {SeqState.PREFILLING, SeqState.KV_PENDING},
+    tasks = [
+        _get_or_create_canonical_cleanup(
+            req, tracker, scheduler, governor, owner_id, timeout_s,
+            transfer_timeout_s if transfer_timeout_s is not None else timeout_s,
         )
-        tracker.transition(req.req_id, SeqState.ABORTED)
-        tracker.remove(req.req_id)
+        for req in tracker.all_requests()
+    ]
+    for task in tasks:
+        await asyncio.shield(task)
 
 
 def main() -> None:

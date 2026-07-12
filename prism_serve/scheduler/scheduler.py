@@ -25,6 +25,15 @@ class QuarantineRecord:
     role: str
     reconciliation_token: str
     quarantined_at: float
+    uncertain_transfer_operations: tuple[tuple[str, str, str, str], ...] = ()
+    uncertain_dispatch_commands: tuple[tuple[str, str, str, str], ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
+class KVUsageSample:
+    ratio: float
+    instance_epoch: str
+    sampled_at: float
 
 
 class QuarantinedInstanceError(ValueError):
@@ -53,8 +62,11 @@ class PDScheduler:
         self._prefill_load: dict[str, int] = {}
         # instance_id → free slot count (decode instances)
         self._decode_free_slots: dict[str, int] = {}
-        # instance_id → KV usage ratio 0.0–1.0 (updated by metrics collector)
-        self._kv_usage: dict[str, float] = {}
+        # Samples are epoch-scoped so a restarted instance cannot reuse stale capacity.
+        self._kv_usage: dict[str, KVUsageSample] = {}
+        self._kv_usage_stale_after_s: float = config.get(
+            "kv_usage_stale_after_s", 10.0
+        )
         self._instance_epochs: dict[str, str] = {}
         self._instance_roles: dict[str, str] = {}
         self._quarantined: dict[str, QuarantineRecord] = {}
@@ -99,7 +111,6 @@ class PDScheduler:
                 f"decode instance must specify max_slots > 0, got {max_slots=}"
             )
             self._decode_free_slots[instance_id] = max_slots
-            self._kv_usage[instance_id] = 0.0
         else:
             raise ValueError(f"unknown role {role!r}; expected 'prefill' or 'decode'")
         self._instance_epochs[instance_id] = epoch
@@ -113,17 +124,51 @@ class PDScheduler:
         self._instance_epochs.pop(instance_id, None)
         self._instance_roles.pop(instance_id, None)
 
-    def quarantine_instance(self, instance_id: str) -> QuarantineRecord:
-        """Remove untrusted capacity until the instance reconciles its epoch."""
+    def quarantine_instance(
+        self,
+        instance_id: str,
+        *,
+        uncertain_transfer: tuple[str, str, str, str] | None = None,
+        uncertain_dispatch: tuple[str, str, str, str] | None = None,
+    ) -> QuarantineRecord:
+        """Remove untrusted capacity while retaining its reconciliation fence."""
         existing = self._quarantined.get(instance_id)
         if existing is not None:
-            return existing
+            transfer_known = uncertain_transfer is None or uncertain_transfer in existing.uncertain_transfer_operations
+            dispatch_known = uncertain_dispatch is None or uncertain_dispatch in existing.uncertain_dispatch_commands
+            if transfer_known and dispatch_known:
+                return existing
+            record = QuarantineRecord(
+                instance_id=existing.instance_id,
+                instance_epoch=existing.instance_epoch,
+                role=existing.role,
+                reconciliation_token=existing.reconciliation_token,
+                quarantined_at=existing.quarantined_at,
+                uncertain_transfer_operations=(
+                    *existing.uncertain_transfer_operations,
+                    *((uncertain_transfer,) if not transfer_known else ()),
+                ),
+                uncertain_dispatch_commands=(
+                    *existing.uncertain_dispatch_commands,
+                    *((uncertain_dispatch,) if not dispatch_known else ()),
+                ),
+            )
+            self._quarantined[instance_id] = record
+            return record
+        epoch = self._instance_epochs.get(instance_id, "unknown")
+        role = self._instance_roles.get(instance_id, "unknown")
         record = QuarantineRecord(
             instance_id=instance_id,
-            instance_epoch=self._instance_epochs.get(instance_id, "unknown"),
-            role=self._instance_roles.get(instance_id, "unknown"),
+            instance_epoch=epoch,
+            role=role,
             reconciliation_token=secrets.token_urlsafe(24),
             quarantined_at=time.monotonic(),
+            uncertain_transfer_operations=(
+                (uncertain_transfer,) if uncertain_transfer is not None else ()
+            ),
+            uncertain_dispatch_commands=(
+                (uncertain_dispatch,) if uncertain_dispatch is not None else ()
+            ),
         )
         self._prefill_load.pop(instance_id, None)
         self._decode_free_slots.pop(instance_id, None)
@@ -139,16 +184,28 @@ class PDScheduler:
         role: str,
         max_slots: int,
         active_request_ids: list[str],
+        active_transfer_operation_ids: list[str] | None = None,
+        pending_dispatch_command_ids: list[str] | None = None,
     ) -> None:
         """Restore quarantined capacity after the instance reports no requests."""
         record = self._quarantined.get(instance_id)
         if record is None:
             raise ValueError(f"instance {instance_id!r} is not quarantined")
         if reconciliation_token != record.reconciliation_token:
-            raise ValueError("reconciliation token does not match")
+            raise ValueError("reconciliation token mismatch")
         if active_request_ids:
             raise ValueError(
-                f"instance still owns active requests: {active_request_ids!r}"
+                f"instance still has active requests: {active_request_ids!r}"
+            )
+        if active_transfer_operation_ids:
+            raise ValueError(
+                "instance still has active transfers: "
+                f"{active_transfer_operation_ids!r}"
+            )
+        if pending_dispatch_command_ids:
+            raise ValueError(
+                "instance still has pending dispatches: "
+                f"{pending_dispatch_command_ids!r}"
             )
         if not instance_epoch:
             raise ValueError("instance_epoch must not be empty")
@@ -168,7 +225,6 @@ class PDScheduler:
             self._prefill_load[instance_id] = 0
         else:
             self._decode_free_slots[instance_id] = max_slots
-            self._kv_usage[instance_id] = 0.0
         self._instance_epochs[instance_id] = instance_epoch
         self._instance_roles[instance_id] = role
         self._quarantined.pop(instance_id)
@@ -214,7 +270,7 @@ class PDScheduler:
         candidates = [
             (iid, slots)
             for iid, slots in self._decode_free_slots.items()
-            if slots > 0 and self._kv_usage.get(iid, 0.0) < high_wm
+            if slots > 0 and self._sample_is_fresh(iid) and self._kv_usage[iid].ratio < high_wm
         ]
         if not candidates:
             return None
@@ -224,21 +280,63 @@ class PDScheduler:
 
     # Feedback from infer layer
 
-    def on_prefill_done(self, instance_id: str) -> None:
-        """Decrement P instance queue depth when prefill completes."""
+    def on_prefill_done(
+        self, instance_id: str, assigned_epoch: str | None = None
+    ) -> bool:
+        """Release one prefill slot if the assigned epoch is still current."""
+        if assigned_epoch is not None and not self.epoch_matches(instance_id, assigned_epoch):
+            return False
         if instance_id in self._prefill_load:
             self._prefill_load[instance_id] = max(
                 0, self._prefill_load[instance_id] - 1
             )
+            return True
+        return False
 
-    def on_decode_finished(self, instance_id: str) -> None:
-        """Return a slot to the D instance when a sequence finishes."""
+    def on_decode_finished(
+        self, instance_id: str, assigned_epoch: str | None = None
+    ) -> bool:
+        """Release one decode slot if the assigned epoch is still current."""
+        if assigned_epoch is not None and not self.epoch_matches(instance_id, assigned_epoch):
+            return False
         if instance_id in self._decode_free_slots:
             self._decode_free_slots[instance_id] += 1
+            return True
+        return False
 
-    def update_kv_usage(self, instance_id: str, ratio: float) -> None:
-        """Update KV usage for a D instance (called by metrics collector)."""
-        self._kv_usage[instance_id] = max(0.0, min(1.0, ratio))
+    def update_kv_usage(
+        self, instance_id: str, sample: KVUsageSample | None
+    ) -> None:
+        """Replace or invalidate an epoch-scoped decode usage sample."""
+        if sample is None:
+            self._kv_usage.pop(instance_id, None)
+            return
+        self._kv_usage[instance_id] = KVUsageSample(
+            ratio=max(0.0, min(1.0, sample.ratio)),
+            instance_epoch=sample.instance_epoch,
+            sampled_at=sample.sampled_at,
+        )
+
+    def _sample_is_fresh(self, instance_id: str, now: float | None = None) -> bool:
+        sample = self._kv_usage.get(instance_id)
+        return bool(
+            sample is not None
+            and sample.instance_epoch == self._instance_epochs.get(instance_id)
+            and (time.monotonic() if now is None else now) - sample.sampled_at
+            <= self._kv_usage_stale_after_s
+        )
+
+    def decode_instance_epochs(self) -> dict[str, str]:
+        return {
+            instance_id: self._instance_epochs[instance_id]
+            for instance_id in self._decode_free_slots
+        }
+
+    def instance_epoch(self, instance_id: str) -> str:
+        return self._instance_epochs.get(instance_id, "unknown")
+
+    def epoch_matches(self, instance_id: str, assigned_epoch: str) -> bool:
+        return bool(assigned_epoch) and self._instance_epochs.get(instance_id) == assigned_epoch
 
     # Adaptive decode instance count
 
@@ -273,5 +371,5 @@ class PDScheduler:
     def decode_free_slots(self) -> dict[str, int]:
         return dict(self._decode_free_slots)
 
-    def kv_usage(self) -> dict[str, float]:
+    def kv_usage(self) -> dict[str, KVUsageSample]:
         return dict(self._kv_usage)

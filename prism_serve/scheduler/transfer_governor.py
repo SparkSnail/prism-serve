@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+import time
 
+from prism_serve.scheduler.scheduler import KVUsageSample
 from prism_serve.scheduler.sequence_state import TransferTask
 
 
@@ -28,8 +30,14 @@ class TransferGovernor:
         self.LOW_WATERMARK      = config.get("LOW_WATERMARK",      self.LOW_WATERMARK)
         self.MAX_BYTES_INFLIGHT = config.get("MAX_BYTES_INFLIGHT", self.MAX_BYTES_INFLIGHT)
 
-        self._kv_usage:       dict[str, float]          = defaultdict(float)
-        self._bytes_inflight: dict[str, int]            = defaultdict(int)
+        # Usage samples are valid only for the destination's current epoch.
+        self._kv_usage:       dict[str, KVUsageSample]       = {}
+        self._expected_epochs: dict[str, str]                 = {}
+        self._kv_usage_stale_after_s: float = config.get(
+            "kv_usage_stale_after_s", 10.0
+        )
+        self._bytes_inflight: dict[str, int]                 = defaultdict(int)
+        # Per-destination FIFO preserves transfer order.
         self._deferred:       dict[str, deque[TransferTask]] = defaultdict(deque)
         # Identity tracking invalidates callbacks from cancelled or superseded tasks.
         self._inflight_tasks: dict[str, TransferTask] = {}
@@ -40,17 +48,48 @@ class TransferGovernor:
 
         self._transfer_timeout_s: float = config.get("kv_transfer_timeout_s", 30.0)
 
-    def update_kv_usage(self, instance_id: str, ratio: float) -> None:
-        """Update KV usage and flush when congestion clears."""
-        prev = self._kv_usage[instance_id]
-        self._kv_usage[instance_id] = max(0.0, min(1.0, ratio))
-        if prev >= self.HIGH_WATERMARK and ratio < self.LOW_WATERMARK:
+    def update_kv_usage(
+        self, instance_id: str, sample: KVUsageSample | None
+    ) -> None:
+        """Replace a usage sample and flush on a fresh high-to-low crossing."""
+        prev = self._kv_usage.get(instance_id)
+        if sample is None:
+            self._kv_usage.pop(instance_id, None)
+            return
+        normalized = KVUsageSample(
+            max(0.0, min(1.0, sample.ratio)),
+            sample.instance_epoch,
+            sample.sampled_at,
+        )
+        self._kv_usage[instance_id] = normalized
+        if (
+            prev is not None
+            and prev.ratio >= self.HIGH_WATERMARK
+            and normalized.ratio < self.LOW_WATERMARK
+            and self._sample_is_fresh(instance_id)
+        ):
             self._flush_deferred(instance_id)
 
+    def set_expected_epochs(self, epochs: dict[str, str]) -> None:
+        self._expected_epochs = dict(epochs)
+        for instance_id, sample in list(self._kv_usage.items()):
+            if sample.instance_epoch != self._expected_epochs.get(instance_id):
+                self._kv_usage.pop(instance_id, None)
+
+    def _sample_is_fresh(self, instance_id: str, now: float | None = None) -> bool:
+        sample = self._kv_usage.get(instance_id)
+        return bool(
+            sample is not None
+            and sample.instance_epoch == self._expected_epochs.get(instance_id)
+            and (time.monotonic() if now is None else now) - sample.sampled_at
+            <= self._kv_usage_stale_after_s
+        )
+
     def can_send(self, dst: str, size_bytes: int, priority: int = 1) -> bool:
-        """Apply the destination watermark and in-flight byte cap."""
-        kv_usage = self._kv_usage.get(dst, 0.0)
-        if kv_usage >= self.HIGH_WATERMARK:
+        """Return whether fresh usage and byte caps permit this transfer."""
+        if not self._sample_is_fresh(dst):
+            return False
+        if self._kv_usage[dst].ratio >= self.HIGH_WATERMARK:
             self.metrics.increment(
                 "kv_transfer_congestion_total", labels={"dst": dst}
             )
@@ -112,7 +151,7 @@ class TransferGovernor:
         self._flush_deferred(task.dst)
 
     def owns(self, req_id: str, operation_id: str) -> bool:
-        """Return whether the ledger owns the specified operation."""
+        """Return whether the ledger owns this request and operation."""
         task = self._inflight_tasks.get(req_id)
         if task is not None:
             return task.operation_id == operation_id
@@ -123,7 +162,7 @@ class TransferGovernor:
         )
 
     def cancel(self, req_id: str, operation_id: str | None = None) -> bool:
-        """Cancel matching accounting and invalidate its late callback."""
+        """Cancel one operation, or all request work when no operation is given."""
         cancelled = False
         for dst, queue in self._deferred.items():
             kept = deque(
@@ -152,7 +191,7 @@ class TransferGovernor:
         return cancelled
 
     def task_state(self, req_id: str, operation_id: str | None = None) -> str:
-        """Return whether a transfer is deferred, in flight, or absent."""
+        """Return whether a transfer is deferred, handed off, or absent."""
         task = self._inflight_tasks.get(req_id)
         if task is not None and (
             operation_id is None or task.operation_id == operation_id

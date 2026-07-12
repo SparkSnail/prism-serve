@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -224,27 +225,50 @@ class MetricsCollector:
             await self._scrape_kv_usage()
 
     async def _scrape_kv_usage(self) -> None:
-        """Ask each D instance for its current KV usage ratio."""
+        """Refresh epoch-scoped KV usage without blocking the scheduler on failure."""
         if self._infer_client is None:
             return
+        expected_epochs = (
+            self._scheduler.decode_instance_epochs()
+            if self._scheduler is not None else {}
+        )
+        if self._governor is not None:
+            self._governor.set_expected_epochs(expected_epochs)
         try:
-            usages: dict[str, float] = await self._infer_client.get_kv_usage_all()
-            for instance_id, ratio in usages.items():
+            usages: dict[str, dict] = await self._infer_client.get_kv_usage_all()
+            if not isinstance(usages, dict):
+                raise ValueError("kv_usage response must be a mapping")
+            sampled_at = time.monotonic()
+            from prism_serve.scheduler.scheduler import KVUsageSample
+
+            for instance_id, expected_epoch in expected_epochs.items():
+                payload = usages.get(instance_id)
+                sample = None
+                if isinstance(payload, dict):
+                    ratio = payload.get("ratio")
+                    epoch = payload.get("instance_epoch")
+                    if isinstance(ratio, (int, float)) and epoch == expected_epoch:
+                        sample = KVUsageSample(float(ratio), epoch, sampled_at)
                 if self._governor is not None:
-                    self._governor.update_kv_usage(instance_id, ratio)
+                    self._governor.update_kv_usage(instance_id, sample)
                 if self._scheduler is not None:
-                    self._scheduler.update_kv_usage(instance_id, ratio)
-                if self._available:
-                    self._slot_util.labels(instance_id=instance_id).set(ratio)
+                    self._scheduler.update_kv_usage(instance_id, sample)
+                if self._available and sample is not None:
+                    self._slot_util.labels(instance_id=instance_id).set(sample.ratio)
         except Exception as exc:
             logger.warning("kv_usage scrape failed: %s", exc)
+            for instance_id in expected_epochs:
+                if self._governor is not None:
+                    self._governor.update_kv_usage(instance_id, None)
+                if self._scheduler is not None:
+                    self._scheduler.update_kv_usage(instance_id, None)
 
     def set_governor(self, governor) -> None:
-        """Inject TransferGovernor so tick_loop can push kv_usage updates."""
+        """Inject the transfer governor for KV usage updates."""
         self._governor = governor
 
     def set_scheduler(self, scheduler) -> None:
-        """Share observed KV watermarks with decode instance selection."""
+        """Share observed KV usage with decode instance selection."""
         self._scheduler = scheduler
 
     async def flush(self) -> None:

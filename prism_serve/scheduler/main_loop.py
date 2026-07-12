@@ -7,6 +7,8 @@ import inspect
 import logging
 import time
 import uuid
+from dataclasses import dataclass
+from enum import Enum, auto
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -53,51 +55,77 @@ async def schedule_loop(
                 break
             d = scheduler.pick_decode_instance(req.req_id, req.kv_size_bytes)
             if d is None:
-                # No D slot / all D instances congested; return P load counter.
+                # Release P load before trying another request.
                 scheduler.on_prefill_done(p)
-                continue  # try other WAITING requests that might fit elsewhere
+                continue
+            p_epoch = scheduler.instance_epoch(p)
+            d_epoch = scheduler.instance_epoch(d)
+            command_id = f"{queue.owner_id}:{req.req_id}"
+            tracker.transition(
+                req.req_id, SeqState.PREFILLING,
+                prefill_instance=p,
+                decode_instance=d,
+                prefill_instance_epoch=p_epoch,
+                decode_instance_epoch=d_epoch,
+                command_id=command_id,
+                publish_outcome="NOT_STARTED",
+            )
+            publish_task = None
             try:
-                await queue.publish(queue.dispatch_subject(p), {
+                publish_task = asyncio.create_task(queue.publish(queue.dispatch_subject(p), {
                     "instance_id": p,
+                    "instance_epoch": p_epoch,
+                    "decode_instance_epoch": d_epoch,
                     "req_id": req.req_id,
                     "owner_id": queue.owner_id,
-                    "command_id": f"{queue.owner_id}:{req.req_id}",
+                    "command_id": command_id,
                     "dispatch_attempt": 1,
                     "prefill_done_subject": queue.reply_subject("prefill_done"),
                     "recompute_done_subject": queue.reply_subject("recompute_done"),
                     "first_token_subject": queue.reply_subject("first_token"),
                     "decode_done_subject": queue.reply_subject("decode_done"),
-                })
-            except Exception as exc:
-                scheduler.on_prefill_done(p)
-                scheduler.on_decode_finished(d)
-                metrics.increment(
-                    "control_message_error_total",
-                    labels={"operation": "dispatch_prefill"},
+                }))
+                await publish_task
+                tracker.set_publish_outcome(req.req_id, "ACKED")
+            except asyncio.CancelledError:
+                tracker.set_publish_outcome(req.req_id, "UNKNOWN")
+                cleanup = _get_or_create_canonical_cleanup(
+                    req, tracker, scheduler, governor, queue.owner_id,
+                    abort_timeout_s, abort_timeout_s,
                 )
+                await asyncio.shield(cleanup)
+                raise
+            except Exception as exc:
+                tracker.set_publish_outcome(
+                    req.req_id, "NOT_STARTED" if publish_task is None else "UNKNOWN"
+                )
+                metrics.increment("control_message_error_total", labels={
+                    "operation": "dispatch_prefill",
+                })
                 logger.warning("dispatch publish failed req=%s: %s", req.req_id, exc)
+                cleanup = _get_or_create_canonical_cleanup(
+                    req, tracker, scheduler, governor, queue.owner_id,
+                    abort_timeout_s, abort_timeout_s,
+                )
+                await asyncio.shield(cleanup)
                 continue
-            tracker.transition(
-                req.req_id, SeqState.PREFILLING,
-                prefill_instance=p,
-                decode_instance=d,
-            )
 
         for req in tracker.get_stuck_prefills(prefill_timeout_s):
             if req.dispatch_attempts >= max_dispatch_attempts:
-                await _abort_and_release(
-                    req, scheduler, governor, queue.owner_id,
-                    abort_timeout_s, include_prefill=True,
+                await _join_canonical_cleanup(
+                    req, tracker, scheduler, governor, queue.owner_id,
+                    abort_timeout_s, abort_timeout_s,
                 )
-                tracker.transition(req.req_id, SeqState.ABORTED)
-                tracker.remove(req.req_id)
                 metrics.increment(
                     "prefill_dispatch_abort_total", labels={"reason": "timeout"}
                 )
                 continue
+            publish_task = None
             try:
-                await queue.publish(queue.dispatch_subject(req.prefill_instance), {
+                publish_task = asyncio.create_task(queue.publish(queue.dispatch_subject(req.prefill_instance), {
                     "instance_id": req.prefill_instance,
+                    "instance_epoch": req.prefill_instance_epoch,
+                    "decode_instance_epoch": req.decode_instance_epoch,
                     "req_id": req.req_id,
                     "owner_id": queue.owner_id,
                     "command_id": f"{queue.owner_id}:{req.req_id}",
@@ -106,13 +134,29 @@ async def schedule_loop(
                     "recompute_done_subject": queue.reply_subject("recompute_done"),
                     "first_token_subject": queue.reply_subject("first_token"),
                     "decode_done_subject": queue.reply_subject("decode_done"),
-                })
-            except Exception as exc:
-                metrics.increment(
-                    "control_message_error_total",
-                    labels={"operation": "retry_prefill"},
+                }))
+                await publish_task
+                tracker.set_publish_outcome(req.req_id, "ACKED")
+            except asyncio.CancelledError:
+                tracker.set_publish_outcome(req.req_id, "UNKNOWN")
+                cleanup = _get_or_create_canonical_cleanup(
+                    req, tracker, scheduler, governor, queue.owner_id,
+                    abort_timeout_s, abort_timeout_s,
                 )
+                await asyncio.shield(cleanup)
+                raise
+            except Exception as exc:
+                tracker.set_publish_outcome(
+                    req.req_id, "NOT_STARTED" if publish_task is None else "UNKNOWN"
+                )
+                metrics.increment("control_message_error_total", labels={
+                    "operation": "retry_prefill",
+                })
                 logger.warning("retry publish failed req=%s: %s", req.req_id, exc)
+                await _join_canonical_cleanup(
+                    req, tracker, scheduler, governor, queue.owner_id,
+                    abort_timeout_s, abort_timeout_s,
+                )
                 continue
             req.prefill_start = time.monotonic()
             req.dispatch_attempts += 1
@@ -124,7 +168,14 @@ async def schedule_loop(
             if req_id is None or req_id not in tracker:
                 continue
             req = tracker.get(req_id)
-            if req is None or req.state != SeqState.PREFILLING:
+            if (
+                req is None
+                or req.state != SeqState.PREFILLING
+                or msg.get("instance_epoch") != req.prefill_instance_epoch
+                or not scheduler.epoch_matches(
+                    req.prefill_instance, req.prefill_instance_epoch
+                )
+            ):
                 continue
 
             kv_size   = msg.get("kv_size_bytes", 0)
@@ -136,7 +187,9 @@ async def schedule_loop(
                 block_table=blk_table,
                 transfer_operation_id=uuid.uuid4().hex,
             )
-            scheduler.on_prefill_done(req.prefill_instance)
+            scheduler.on_prefill_done(
+                req.prefill_instance, req.prefill_instance_epoch
+            )
 
             try:
                 governor.submit(TransferTask(
@@ -159,21 +212,41 @@ async def schedule_loop(
                     req_id, req.decode_instance, "dispatch_error"
                 )
                 if decision == "recompute":
-                    governor.trigger_recompute(req_id, req.decode_instance)
+                    if not scheduler.epoch_matches(
+                        req.decode_instance, req.decode_instance_epoch
+                    ):
+                        await _join_canonical_cleanup(
+                            req, tracker, scheduler, governor, queue.owner_id,
+                            abort_timeout_s, abort_timeout_s,
+                        )
+                        continue
+                    if not await _trigger_recompute_epoch_fenced(
+                        req, scheduler, governor
+                    ):
+                        governor.finish_request(req.req_id)
+                        await _join_canonical_cleanup(
+                            req, tracker, scheduler, governor, queue.owner_id,
+                            abort_timeout_s, abort_timeout_s,
+                        )
+                        continue
                     tracker.transition(req_id, SeqState.RECOMPUTING)
                 else:
-                    await _abort_and_release(
-                        req, scheduler, governor, queue.owner_id,
-                        abort_timeout_s, include_prefill=False,
+                    await _join_canonical_cleanup(
+                        req, tracker, scheduler, governor, queue.owner_id,
+                        abort_timeout_s, abort_timeout_s,
                     )
-                    tracker.transition(req_id, SeqState.ABORTED)
-                    tracker.remove(req_id)
 
-        # Recover or abort timed-out work.
-        # Process before the deferred queue flush so timed-out tasks are not
-        # re-flushed from the deferred queue in the same tick.
+        # Handle timeouts before deferred work can be flushed in this tick.
         for req in tracker.get_stuck_requests(kv_transfer_timeout_s):
             operation_id = req.transfer_operation_id
+            if classify_transfer_epochs(
+                req, scheduler
+            ) != TransferEpochResult.BOTH_CURRENT:
+                await _join_canonical_cleanup(
+                    req, tracker, scheduler, governor, queue.owner_id,
+                    abort_timeout_s, abort_timeout_s,
+                )
+                continue
             if not _matches_pending_operation(
                 req.req_id, operation_id, tracker
             ):
@@ -192,69 +265,116 @@ async def schedule_loop(
                 if not _owns_pending_transfer(
                     req.req_id, operation_id, tracker, governor
                 ):
-                    # Completion or cancellation won while abort was pending.
+                    # Completion or cancellation won the race while abort awaited.
+                    continue
+                if classify_transfer_epochs(
+                    req, scheduler
+                ) != TransferEpochResult.BOTH_CURRENT:
+                    await _join_canonical_cleanup(
+                        req, tracker, scheduler, governor, queue.owner_id,
+                        abort_timeout_s, abort_timeout_s,
+                    )
                     continue
                 if not stopped:
-                    governor.cancel(req.req_id, operation_id)
-                    scheduler.quarantine_instance(req.decode_instance)
-                    governor.finish_request(req.req_id)
-                    tracker.transition(req.req_id, SeqState.ABORTED)
-                    tracker.remove(req.req_id)
+                    await _join_canonical_cleanup(
+                        req, tracker, scheduler, governor, queue.owner_id,
+                        abort_timeout_s, abort_timeout_s,
+                    )
                     metrics.increment(
                         "kv_transfer_abort_total",
                         labels={"reason": "transfer_abort_unconfirmed"},
                     )
                     continue
             elif transfer_state == "none":
-                scheduler.quarantine_instance(req.decode_instance)
-                governor.finish_request(req.req_id)
-                tracker.transition(req.req_id, SeqState.ABORTED)
-                tracker.remove(req.req_id)
+                # No local ownership and no completion: remote handoff is unknown.
+                await _join_canonical_cleanup(
+                    req, tracker, scheduler, governor, queue.owner_id,
+                    abort_timeout_s, abort_timeout_s,
+                )
                 continue
             governor.cancel(req.req_id, operation_id)
             decision = governor.on_transfer_failure(
                 req.req_id, req.decode_instance, "timeout"
             )
             if decision == "recompute":
-                governor.trigger_recompute(req.req_id, req.decode_instance)
+                if not scheduler.epoch_matches(
+                    req.decode_instance, req.decode_instance_epoch
+                ):
+                    await _join_canonical_cleanup(
+                        req, tracker, scheduler, governor, queue.owner_id,
+                        abort_timeout_s, abort_timeout_s,
+                    )
+                    continue
+                if not await _trigger_recompute_epoch_fenced(
+                    req, scheduler, governor
+                ):
+                    governor.finish_request(req.req_id)
+                    await _join_canonical_cleanup(
+                        req, tracker, scheduler, governor, queue.owner_id,
+                        abort_timeout_s, abort_timeout_s,
+                    )
+                    continue
                 tracker.transition(req.req_id, SeqState.RECOMPUTING)
-                logger.info(
-                    "recompute triggered for req=%s dst=%s",
-                    req.req_id, req.decode_instance,
-                )
+                logger.info("recompute triggered req=%s dst=%s",
+                            req.req_id, req.decode_instance)
             else:  # abort
-                await _abort_and_release(
-                    req, scheduler, governor, queue.owner_id,
-                    abort_timeout_s, include_prefill=False,
+                await _join_canonical_cleanup(
+                    req, tracker, scheduler, governor, queue.owner_id,
+                    abort_timeout_s, abort_timeout_s,
                 )
-                tracker.transition(req.req_id, SeqState.ABORTED)
-                tracker.remove(req.req_id)
-                logger.warning(
-                    "request aborted (max_recompute exhausted) req=%s",
-                    req.req_id,
-                )
+                logger.warning("request aborted after recompute limit req=%s", req.req_id)
 
+        # A successful local recompute enters decode on the original D instance.
         for msg in await queue.poll("recompute_done"):
             req_id = msg.get("req_id")
             req = tracker.get(req_id) if req_id is not None else None
-            if req is None or req.state != SeqState.RECOMPUTING:
+            if (
+                req is None
+                or req.state != SeqState.RECOMPUTING
+                or msg.get("instance_epoch") != req.decode_instance_epoch
+                or not scheduler.epoch_matches(
+                    req.decode_instance, req.decode_instance_epoch
+                )
+            ):
                 continue
             tracker.transition(req_id, SeqState.DECODING)
 
         for req in tracker.get_stuck_recomputes(recompute_timeout_s):
+            if not scheduler.epoch_matches(
+                req.decode_instance, req.decode_instance_epoch
+            ):
+                await _join_canonical_cleanup(
+                    req, tracker, scheduler, governor, queue.owner_id,
+                    abort_timeout_s, abort_timeout_s,
+                )
+                continue
             decision = governor.on_transfer_failure(
                 req.req_id, req.decode_instance, "recompute_timeout"
             )
             if decision == "recompute":
-                governor.trigger_recompute(req.req_id, req.decode_instance)
+                if not scheduler.epoch_matches(
+                    req.decode_instance, req.decode_instance_epoch
+                ):
+                    await _join_canonical_cleanup(
+                        req, tracker, scheduler, governor, queue.owner_id,
+                        abort_timeout_s, abort_timeout_s,
+                    )
+                    continue
+                if not await _trigger_recompute_epoch_fenced(
+                    req, scheduler, governor
+                ):
+                    governor.finish_request(req.req_id)
+                    await _join_canonical_cleanup(
+                        req, tracker, scheduler, governor, queue.owner_id,
+                        abort_timeout_s, abort_timeout_s,
+                    )
+                    continue
                 req.recompute_start = time.monotonic()
             else:
-                await _abort_and_release(
-                    req, scheduler, governor, queue.owner_id,
-                    abort_timeout_s, include_prefill=False,
+                await _join_canonical_cleanup(
+                    req, tracker, scheduler, governor, queue.owner_id,
+                    abort_timeout_s, abort_timeout_s,
                 )
-                tracker.transition(req.req_id, SeqState.ABORTED)
-                tracker.remove(req.req_id)
 
         # Flush deferred transfers after timeout handling.
         governor.tick()
@@ -262,7 +382,14 @@ async def schedule_loop(
         # Process decode progress and completion.
         for msg in await queue.poll("first_token"):
             req_id = msg.get("req_id")
-            if req_id is not None:
+            req = tracker.get(req_id) if req_id is not None else None
+            if (
+                req is not None
+                and msg.get("instance_epoch") == req.decode_instance_epoch
+                and scheduler.epoch_matches(
+                    req.decode_instance, req.decode_instance_epoch
+                )
+            ):
                 tracker.record_first_token(req_id)
 
         for msg in await queue.poll("decode_done"):
@@ -270,21 +397,30 @@ async def schedule_loop(
             if req_id is None or req_id not in tracker:
                 continue
             req = tracker.get(req_id)
-            if req is None or req.state != SeqState.DECODING:
+            if (
+                req is None
+                or req.state != SeqState.DECODING
+                or msg.get("instance_epoch") != req.decode_instance_epoch
+                or not scheduler.epoch_matches(
+                    req.decode_instance, req.decode_instance_epoch
+                )
+            ):
                 continue
             tracker.transition(req_id, SeqState.FINISHED)
-            scheduler.on_decode_finished(req.decode_instance)
+            scheduler.on_decode_finished(
+                req.decode_instance, req.decode_instance_epoch
+            )
             governor.finish_request(req_id)
             tracker.remove(req_id)
 
         for req in tracker.get_stuck_decodes(decode_timeout_s):
-            await _abort_and_release(
-                req, scheduler, governor, queue.owner_id,
-                abort_timeout_s, include_prefill=False,
+            await _join_canonical_cleanup(
+                req, tracker, scheduler, governor, queue.owner_id,
+                abort_timeout_s, abort_timeout_s,
             )
-            tracker.transition(req.req_id, SeqState.ABORTED)
-            tracker.remove(req.req_id)
-            metrics.increment("decode_abort_total", labels={"reason": "timeout"})
+            metrics.increment(
+                "decode_abort_total", labels={"reason": "timeout"}
+            )
 
         # Publish the current scheduler snapshot.
         metrics.gauge("active_requests", len(tracker))
@@ -318,6 +454,12 @@ async def _abort_and_release(
         instances.append(("decode", req.decode_instance))
 
     for role, instance_id in instances:
+        assigned_epoch = (
+            req.prefill_instance_epoch
+            if role == "prefill" else req.decode_instance_epoch
+        )
+        if not scheduler.epoch_matches(instance_id, assigned_epoch):
+            continue
         acknowledged = await _abort_remote_request(
             governor.infer_client, instance_id, owner_id, req.req_id, timeout_s
         )
@@ -326,10 +468,436 @@ async def _abort_and_release(
             scheduler.quarantine_instance(instance_id)
             continue
         if role == "prefill":
-            scheduler.on_prefill_done(instance_id)
+            scheduler.on_prefill_done(instance_id, assigned_epoch)
         else:
-            scheduler.on_decode_finished(instance_id)
+            scheduler.on_decode_finished(instance_id, assigned_epoch)
     governor.finish_request(req.req_id)
+
+
+class RemoteRequestState(Enum):
+    NOT_OWNED = auto()
+    NEVER_DISPATCHED = auto()
+    ABORT_ACK = auto()
+    UNCERTAIN = auto()
+    ALREADY_COMPLETED = auto()
+
+
+class TransferCleanupState(Enum):
+    NONE = auto()
+    DEFERRED_CANCELLED = auto()
+    FENCED_ACK = auto()
+    UNCERTAIN = auto()
+
+
+class TransferEpochResult(Enum):
+    BOTH_CURRENT = auto()
+    SOURCE_CHANGED_TARGET_CURRENT = auto()
+    TARGET_CHANGED = auto()
+
+
+def classify_transfer_epochs(req, scheduler: "PDScheduler") -> TransferEpochResult:
+    """Target precedence prevents a both-changed race from mutating new D state."""
+    if not scheduler.epoch_matches(
+        req.decode_instance, req.decode_instance_epoch
+    ):
+        return TransferEpochResult.TARGET_CHANGED
+    if not scheduler.epoch_matches(
+        req.prefill_instance, req.prefill_instance_epoch
+    ):
+        return TransferEpochResult.SOURCE_CHANGED_TARGET_CURRENT
+    return TransferEpochResult.BOTH_CURRENT
+
+
+def quarantine_source_changed_transfer(
+    req, scheduler: "PDScheduler", governor: "TransferGovernor", owner_id: str
+) -> None:
+    scheduler.quarantine_instance(
+        req.decode_instance,
+        uncertain_transfer=(
+            owner_id, req.req_id, req.transfer_operation_id,
+            req.decode_instance_epoch,
+        ),
+    )
+    governor.cancel(req.req_id, req.transfer_operation_id)
+
+
+@dataclass(slots=True, frozen=True)
+class CleanupProof:
+    request_state: "SeqState"
+    p_remote_request_state: RemoteRequestState
+    d_remote_request_state: RemoteRequestState
+    transfer_state: TransferCleanupState
+    transfer_mode: str
+    publish_outcome: str
+    request_owns_p_load: bool
+    request_owns_original_d_slot: bool
+    d_epoch_changed: bool = False
+
+
+def p_load_releasable(proof: CleanupProof) -> bool:
+    return (
+        not proof.request_owns_p_load
+        or proof.p_remote_request_state in {
+            RemoteRequestState.NOT_OWNED,
+            RemoteRequestState.ALREADY_COMPLETED,
+        }
+        or proof.publish_outcome == "NOT_STARTED"
+        and proof.p_remote_request_state == RemoteRequestState.NEVER_DISPATCHED
+        or proof.publish_outcome == "ACKED"
+        and proof.p_remote_request_state == RemoteRequestState.ABORT_ACK
+    )
+
+
+def validate_cleanup_proof(proof: CleanupProof) -> None:
+    from prism_serve.scheduler.sequence_state import SeqState
+
+    state = proof.request_state
+    valid = False
+    if state == SeqState.WAITING:
+        valid = (
+            not proof.request_owns_p_load
+            and not proof.request_owns_original_d_slot
+            and proof.p_remote_request_state == RemoteRequestState.NOT_OWNED
+            and proof.d_remote_request_state == RemoteRequestState.NEVER_DISPATCHED
+            and proof.transfer_state == TransferCleanupState.NONE
+            and proof.transfer_mode == "none"
+        )
+    elif state == SeqState.PREFILLING:
+        p_valid = (
+            proof.publish_outcome == "NOT_STARTED"
+            and proof.p_remote_request_state == RemoteRequestState.NEVER_DISPATCHED
+            or proof.publish_outcome == "ACKED"
+            and proof.p_remote_request_state in {
+                RemoteRequestState.ABORT_ACK, RemoteRequestState.UNCERTAIN,
+            }
+            or proof.publish_outcome == "UNKNOWN"
+            and proof.p_remote_request_state in {
+                RemoteRequestState.NEVER_DISPATCHED,
+                RemoteRequestState.ABORT_ACK,
+                RemoteRequestState.UNCERTAIN,
+            }
+        )
+        valid = (
+            proof.request_owns_p_load and proof.request_owns_original_d_slot
+            and p_valid
+            and proof.d_remote_request_state == RemoteRequestState.NEVER_DISPATCHED
+            and proof.transfer_state == TransferCleanupState.NONE
+            and proof.transfer_mode == "none"
+        )
+    elif state == SeqState.KV_PENDING:
+        valid = (
+            not proof.request_owns_p_load and proof.request_owns_original_d_slot
+            and proof.p_remote_request_state == RemoteRequestState.ALREADY_COMPLETED
+            and proof.d_remote_request_state in {
+                RemoteRequestState.ABORT_ACK, RemoteRequestState.UNCERTAIN,
+            }
+            and (
+                proof.transfer_mode == "deferred"
+                and proof.transfer_state == TransferCleanupState.DEFERRED_CANCELLED
+                or proof.transfer_mode == "inflight"
+                and proof.transfer_state in {
+                    TransferCleanupState.FENCED_ACK,
+                    TransferCleanupState.UNCERTAIN,
+                }
+            )
+        )
+    elif state == SeqState.DECODING:
+        valid = (
+            not proof.request_owns_p_load and proof.request_owns_original_d_slot
+            and proof.p_remote_request_state == RemoteRequestState.ALREADY_COMPLETED
+            and proof.d_remote_request_state in {
+                RemoteRequestState.ABORT_ACK, RemoteRequestState.UNCERTAIN,
+            }
+            and proof.transfer_state == TransferCleanupState.NONE
+            and proof.transfer_mode == "none"
+        )
+    elif state == SeqState.RECOMPUTING:
+        valid = (
+            not proof.request_owns_p_load and proof.request_owns_original_d_slot
+            and proof.p_remote_request_state == RemoteRequestState.ALREADY_COMPLETED
+            and proof.d_remote_request_state in {
+                RemoteRequestState.ABORT_ACK, RemoteRequestState.UNCERTAIN,
+            }
+            and proof.transfer_state == TransferCleanupState.FENCED_ACK
+            and proof.transfer_mode == "none"
+        )
+    if not valid:
+        raise ValueError("invalid cleanup proof ownership combination")
+
+
+def d_slot_releasable(proof: CleanupProof) -> bool:
+    from prism_serve.scheduler.sequence_state import SeqState
+
+    if not proof.request_owns_original_d_slot or proof.d_epoch_changed:
+        return False
+    state = proof.request_state
+    return (
+        state == SeqState.PREFILLING
+        and proof.d_remote_request_state == RemoteRequestState.NEVER_DISPATCHED
+        and proof.transfer_state == TransferCleanupState.NONE
+        or state == SeqState.KV_PENDING
+        and proof.d_remote_request_state == RemoteRequestState.ABORT_ACK
+        and proof.transfer_state
+        in {TransferCleanupState.DEFERRED_CANCELLED, TransferCleanupState.FENCED_ACK}
+        or state == SeqState.DECODING
+        and proof.d_remote_request_state == RemoteRequestState.ABORT_ACK
+        and proof.transfer_state == TransferCleanupState.NONE
+        or state == SeqState.RECOMPUTING
+        and proof.d_remote_request_state == RemoteRequestState.ABORT_ACK
+        and proof.transfer_state == TransferCleanupState.FENCED_ACK
+    )
+
+
+def _get_or_create_canonical_cleanup(
+    req,
+    tracker: "RequestTracker",
+    scheduler: "PDScheduler",
+    governor: "TransferGovernor",
+    owner_id: str,
+    request_timeout_s: float,
+    transfer_timeout_s: float,
+) -> asyncio.Task:
+    return tracker.get_or_create_cleanup_task(
+        req.req_id,
+        lambda: _canonical_cleanup(
+            req, tracker, scheduler, governor, owner_id,
+            request_timeout_s, transfer_timeout_s,
+        ),
+    )
+
+
+async def _canonical_cleanup(
+    req,
+    tracker: "RequestTracker",
+    scheduler: "PDScheduler",
+    governor: "TransferGovernor",
+    owner_id: str,
+    request_timeout_s: float,
+    transfer_timeout_s: float,
+) -> None:
+    """Own all terminal resource mutations for one request."""
+    from prism_serve.scheduler.sequence_state import SeqState
+
+    if tracker.get(req.req_id) is not req:
+        return
+    if req.state == SeqState.PREFILLING and req.publish_outcome == "UNKNOWN":
+        p_epoch_matches = scheduler.epoch_matches(
+            req.prefill_instance, req.prefill_instance_epoch
+        )
+        if p_epoch_matches:
+            scheduler.quarantine_instance(
+                req.prefill_instance,
+                uncertain_dispatch=(
+                    owner_id, req.req_id, req.command_id,
+                    req.prefill_instance_epoch,
+                ),
+            )
+        scheduler.on_decode_finished(
+            req.decode_instance, req.decode_instance_epoch
+        )
+        # Quarantine is already authoritative; abort is bounded best effort only.
+        if p_epoch_matches:
+            await _abort_remote_request(
+                governor.infer_client, req.prefill_instance, owner_id,
+                req.req_id, request_timeout_s,
+            )
+        governor.finish_request(req.req_id)
+    elif req.state == SeqState.PREFILLING and req.publish_outcome == "NOT_STARTED":
+        scheduler.on_prefill_done(
+            req.prefill_instance, req.prefill_instance_epoch
+        )
+        scheduler.on_decode_finished(
+            req.decode_instance, req.decode_instance_epoch
+        )
+        governor.finish_request(req.req_id)
+    else:
+        await _fence_and_abort_request(
+            req, scheduler, governor, owner_id,
+            request_timeout_s, transfer_timeout_s,
+        )
+    if tracker.get(req.req_id) is req:
+        if req.state not in {SeqState.FINISHED, SeqState.ABORTED}:
+            tracker.transition(req.req_id, SeqState.ABORTED)
+        tracker.remove(req.req_id)
+    current = asyncio.current_task()
+    if current is not None:
+        tracker.clear_cleanup_task(req.req_id, current)
+
+
+async def _join_canonical_cleanup(
+    req,
+    tracker: "RequestTracker",
+    scheduler: "PDScheduler",
+    governor: "TransferGovernor",
+    owner_id: str,
+    request_timeout_s: float,
+    transfer_timeout_s: float,
+) -> None:
+    task = _get_or_create_canonical_cleanup(
+        req, tracker, scheduler, governor, owner_id,
+        request_timeout_s, transfer_timeout_s,
+    )
+    await asyncio.shield(task)
+
+
+async def _fence_and_abort_request(
+    req,
+    scheduler: "PDScheduler",
+    governor: "TransferGovernor",
+    owner_id: str,
+    request_timeout_s: float,
+    transfer_timeout_s: float,
+) -> CleanupProof:
+    """Build independent P, D, and transfer cleanup evidence."""
+    from prism_serve.scheduler.sequence_state import SeqState
+
+    owns_p = req.state == SeqState.PREFILLING and bool(req.prefill_instance)
+    owns_d = bool(req.decode_instance) and req.state != SeqState.WAITING
+    p_epoch_changed = owns_p and not scheduler.epoch_matches(
+        req.prefill_instance, req.prefill_instance_epoch
+    )
+    target_epoch_changed = owns_d and not scheduler.epoch_matches(
+        req.decode_instance, req.decode_instance_epoch
+    )
+    source_changed_target_current = False
+    p_state = (
+        RemoteRequestState.NEVER_DISPATCHED
+        if owns_p
+        else RemoteRequestState.NOT_OWNED
+        if req.state == SeqState.WAITING
+        else RemoteRequestState.ALREADY_COMPLETED
+    )
+    d_state = RemoteRequestState.NEVER_DISPATCHED
+    transfer_state = TransferCleanupState.NONE
+
+    task_state = governor.task_state(req.req_id, req.transfer_operation_id or None)
+    if target_epoch_changed and req.state == SeqState.KV_PENDING:
+        # Reconciliation into the current epoch already proved old operations absent.
+        transfer_state = TransferCleanupState.FENCED_ACK
+    elif req.state == SeqState.KV_PENDING and task_state == "deferred":
+        governor.cancel(req.req_id, req.transfer_operation_id)
+        transfer_state = TransferCleanupState.DEFERRED_CANCELLED
+    elif req.state == SeqState.KV_PENDING and task_state == "inflight":
+        epoch_result = classify_transfer_epochs(req, scheduler)
+        if epoch_result == TransferEpochResult.BOTH_CURRENT:
+            fenced = await _abort_remote_transfer(
+                governor.infer_client,
+                req.prefill_instance,
+                req.decode_instance,
+                owner_id,
+                req.req_id,
+                req.transfer_operation_id,
+                transfer_timeout_s,
+            )
+            epoch_result = classify_transfer_epochs(req, scheduler)
+            if epoch_result == TransferEpochResult.BOTH_CURRENT:
+                transfer_state = (
+                    TransferCleanupState.FENCED_ACK
+                    if fenced else TransferCleanupState.UNCERTAIN
+                )
+            elif epoch_result == TransferEpochResult.TARGET_CHANGED:
+                target_epoch_changed = True
+                governor.cancel(req.req_id, req.transfer_operation_id)
+            else:
+                source_changed_target_current = True
+                transfer_state = TransferCleanupState.UNCERTAIN
+                quarantine_source_changed_transfer(
+                    req, scheduler, governor, owner_id
+                )
+        elif epoch_result == TransferEpochResult.TARGET_CHANGED:
+            target_epoch_changed = True
+            governor.cancel(req.req_id, req.transfer_operation_id)
+        else:
+            source_changed_target_current = True
+            transfer_state = TransferCleanupState.UNCERTAIN
+            quarantine_source_changed_transfer(req, scheduler, governor, owner_id)
+    elif req.state == SeqState.RECOMPUTING:
+        transfer_state = TransferCleanupState.FENCED_ACK
+    elif req.state == SeqState.KV_PENDING and task_state == "none":
+        task_state = "inflight"
+        transfer_state = TransferCleanupState.UNCERTAIN
+
+    if owns_p and not p_epoch_changed:
+        acknowledged = await _abort_remote_request(
+            governor.infer_client, req.prefill_instance, owner_id,
+            req.req_id, request_timeout_s,
+        )
+        if scheduler.epoch_matches(
+            req.prefill_instance, req.prefill_instance_epoch
+        ):
+            p_state = (
+                RemoteRequestState.ABORT_ACK
+                if acknowledged else RemoteRequestState.UNCERTAIN
+            )
+        else:
+            p_epoch_changed = True
+    if (
+        not target_epoch_changed
+        and not source_changed_target_current
+        and req.state in {SeqState.KV_PENDING, SeqState.RECOMPUTING, SeqState.DECODING}
+    ):
+        acknowledged = await _abort_remote_request(
+            governor.infer_client, req.decode_instance, owner_id,
+            req.req_id, request_timeout_s,
+        )
+        if scheduler.epoch_matches(
+            req.decode_instance, req.decode_instance_epoch
+        ):
+            d_state = (
+                RemoteRequestState.ABORT_ACK
+                if acknowledged else RemoteRequestState.UNCERTAIN
+            )
+        else:
+            target_epoch_changed = True
+            governor.cancel(req.req_id, req.transfer_operation_id or None)
+
+    proof = CleanupProof(
+        request_state=req.state,
+        p_remote_request_state=p_state,
+        d_remote_request_state=d_state,
+        transfer_state=transfer_state,
+        transfer_mode=(
+            task_state if req.state == SeqState.KV_PENDING else "none"
+        ),
+        publish_outcome=req.publish_outcome,
+        request_owns_p_load=owns_p,
+        request_owns_original_d_slot=owns_d,
+        d_epoch_changed=target_epoch_changed,
+    )
+    if (
+        not p_epoch_changed
+        and not target_epoch_changed
+        and not source_changed_target_current
+    ):
+        validate_cleanup_proof(proof)
+    if owns_p and not p_epoch_changed:
+        if p_load_releasable(proof):
+            scheduler.on_prefill_done(
+                req.prefill_instance, req.prefill_instance_epoch
+            )
+        else:
+            scheduler.quarantine_instance(req.prefill_instance)
+    if owns_d and not target_epoch_changed and not source_changed_target_current:
+        if d_slot_releasable(proof):
+            scheduler.on_decode_finished(
+                req.decode_instance, req.decode_instance_epoch
+            )
+        else:
+            uncertain = None
+            if transfer_state == TransferCleanupState.UNCERTAIN:
+                uncertain = (
+                    owner_id,
+                    req.req_id,
+                    req.transfer_operation_id,
+                    scheduler.instance_epoch(req.decode_instance),
+                )
+            scheduler.quarantine_instance(
+                req.decode_instance, uncertain_transfer=uncertain
+            )
+
+    # UNKNOWN remote transfer ownership moves to quarantine before ledger deletion.
+    governor.finish_request(req.req_id)
+    return proof
 
 
 async def _abort_remote_request(
@@ -425,26 +993,30 @@ def _on_kv_done(
     if (
         req.state != SeqState.KV_PENDING
         or req.transfer_operation_id != operation_id
+        or not scheduler.epoch_matches(
+            req.decode_instance, req.decode_instance_epoch
+        )
     ):
-        # Request was already recomputed or aborted; ignore stale callback.
+        # Recompute or abort made this callback stale.
         return
     tracker.transition(req_id, SeqState.DECODING)
-    metrics.increment("kv_transfer_success_total")
 
 
-def _matches_pending_operation(
-    req_id: str,
-    operation_id: str,
-    tracker: "RequestTracker",
+async def _trigger_recompute_epoch_fenced(
+    req,
+    scheduler: "PDScheduler",
+    governor: "TransferGovernor",
 ) -> bool:
-    """Return whether the tracker still binds the pending operation."""
-    from prism_serve.scheduler.sequence_state import SeqState
-
-    req = tracker.get(req_id)
-    return bool(
-        req is not None
-        and req.state == SeqState.KV_PENDING
-        and req.transfer_operation_id == operation_id
+    """Commit recompute only if the decode epoch is stable across the action."""
+    if not scheduler.epoch_matches(
+        req.decode_instance, req.decode_instance_epoch
+    ):
+        return False
+    result = governor.trigger_recompute(req.req_id, req.decode_instance)
+    if inspect.isawaitable(result):
+        await result
+    return scheduler.epoch_matches(
+        req.decode_instance, req.decode_instance_epoch
     )
 
 
@@ -454,8 +1026,24 @@ def _owns_pending_transfer(
     tracker: "RequestTracker",
     governor: "TransferGovernor",
 ) -> bool:
-    """Return whether tracker and governor still own the same operation."""
+    """Check the operation-scoped precondition shared by completion and timeout."""
     return (
         _matches_pending_operation(req_id, operation_id, tracker)
         and governor.owns(req_id, operation_id)
+    )
+
+
+def _matches_pending_operation(
+    req_id: str,
+    operation_id: str,
+    tracker: "RequestTracker",
+) -> bool:
+    """Return whether this operation may still win completion or timeout."""
+    from prism_serve.scheduler.sequence_state import SeqState
+
+    req = tracker.get(req_id)
+    return bool(
+        req is not None
+        and req.state == SeqState.KV_PENDING
+        and req.transfer_operation_id == operation_id
     )

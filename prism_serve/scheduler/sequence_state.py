@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import asyncio
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Iterator
@@ -27,8 +28,10 @@ class RequestInfo:
     req_id: str
     state: SeqState = SeqState.WAITING
 
-    prefill_instance: str = ""   # e.g. "p-0"
-    decode_instance:  str = ""   # e.g. "d-0"
+    prefill_instance: str = ""
+    decode_instance:  str = ""
+    prefill_instance_epoch: str = ""
+    decode_instance_epoch: str = ""
 
     arrived_at:    float = field(default_factory=time.monotonic)
     prefill_start: float = 0.0   # when dispatch_prefill was sent
@@ -44,6 +47,8 @@ class RequestInfo:
     kv_size_bytes: int = 0
     block_table:   list[int] = field(default_factory=list)
     transfer_operation_id: str = ""
+    command_id: str = ""
+    publish_outcome: str = "NOT_STARTED"
 
     def ttft_ms(self) -> float:
         """Return first-token latency in milliseconds, or -1 if unknown."""
@@ -137,6 +142,7 @@ class RequestTracker:
     def __init__(self, metrics) -> None:
         self.metrics = metrics
         self._requests: dict[str, RequestInfo] = {}
+        self._cleanup_tasks: dict[str, asyncio.Task] = {}
 
     def add(self, req: RequestInfo) -> None:
         """Register a new request (must start in WAITING state)."""
@@ -151,6 +157,32 @@ class RequestTracker:
 
     def get(self, req_id: str) -> RequestInfo | None:
         return self._requests.get(req_id)
+
+    def set_publish_outcome(self, req_id: str, outcome: str) -> None:
+        assert outcome in {"NOT_STARTED", "ACKED", "UNKNOWN"}
+        self._requests[req_id].publish_outcome = outcome
+
+    def get_or_create_cleanup_task(self, req_id: str, factory) -> asyncio.Task:
+        """CAS-create one supervisor-owned cleanup task per request."""
+        existing = self._cleanup_tasks.get(req_id)
+        if existing is not None:
+            return existing
+        task = asyncio.create_task(factory())
+        self._cleanup_tasks[req_id] = task
+
+        def forget(done: asyncio.Task) -> None:
+            if self._cleanup_tasks.get(req_id) is done:
+                self._cleanup_tasks.pop(req_id, None)
+
+        task.add_done_callback(forget)
+        return task
+
+    def cleanup_task(self, req_id: str) -> asyncio.Task | None:
+        return self._cleanup_tasks.get(req_id)
+
+    def clear_cleanup_task(self, req_id: str, task: asyncio.Task) -> None:
+        if self._cleanup_tasks.get(req_id) is task:
+            self._cleanup_tasks.pop(req_id, None)
 
     def transition(self, req_id: str, new_state: SeqState, **kwargs) -> None:
         """Advance a request and update its phase timestamps."""
