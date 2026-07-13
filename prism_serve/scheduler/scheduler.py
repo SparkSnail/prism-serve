@@ -36,6 +36,16 @@ class KVUsageSample:
     sampled_at: float
 
 
+@dataclass(slots=True)
+class DecodeSlotLease:
+    lease_id: str
+    operation_id: str
+    req_id: str
+    instance_id: str
+    state: str
+    reserved_at: float
+
+
 class QuarantinedInstanceError(ValueError):
     def __init__(self, record: QuarantineRecord) -> None:
         super().__init__(f"instance {record.instance_id!r} is quarantined")
@@ -62,6 +72,8 @@ class PDScheduler:
         self._prefill_load: dict[str, int] = {}
         # instance_id → free slot count (decode instances)
         self._decode_free_slots: dict[str, int] = {}
+        self._decode_max_slots: dict[str, int] = {}
+        self._slot_leases: dict[str, DecodeSlotLease] = {}
         # Samples are epoch-scoped so a restarted instance cannot reuse stale capacity.
         self._kv_usage: dict[str, KVUsageSample] = {}
         self._kv_usage_stale_after_s: float = config.get(
@@ -111,6 +123,7 @@ class PDScheduler:
                 f"decode instance must specify max_slots > 0, got {max_slots=}"
             )
             self._decode_free_slots[instance_id] = max_slots
+            self._decode_max_slots[instance_id] = max_slots
         else:
             raise ValueError(f"unknown role {role!r}; expected 'prefill' or 'decode'")
         self._instance_epochs[instance_id] = epoch
@@ -120,6 +133,7 @@ class PDScheduler:
         """Remove an instance that is going offline."""
         self._prefill_load.pop(instance_id, None)
         self._decode_free_slots.pop(instance_id, None)
+        self._decode_max_slots.pop(instance_id, None)
         self._kv_usage.pop(instance_id, None)
         self._instance_epochs.pop(instance_id, None)
         self._instance_roles.pop(instance_id, None)
@@ -172,6 +186,7 @@ class PDScheduler:
         )
         self._prefill_load.pop(instance_id, None)
         self._decode_free_slots.pop(instance_id, None)
+        self._decode_max_slots.pop(instance_id, None)
         self._kv_usage.pop(instance_id, None)
         self._quarantined[instance_id] = record
         return record
@@ -225,6 +240,7 @@ class PDScheduler:
             self._prefill_load[instance_id] = 0
         else:
             self._decode_free_slots[instance_id] = max_slots
+            self._decode_max_slots[instance_id] = max_slots
         self._instance_epochs[instance_id] = instance_epoch
         self._instance_roles[instance_id] = role
         self._quarantined.pop(instance_id)
@@ -278,6 +294,72 @@ class PDScheduler:
         self._decode_free_slots[best] -= 1
         return best
 
+    def reserve_decode_slot(
+        self, instance_id: str, req_id: str, operation_id: str
+    ) -> DecodeSlotLease | None:
+        """Reserve one process-local decode slot for an affinity operation."""
+        assert operation_id, "decode slot reservation requires operation_id"
+        existing = self._slot_leases.get(operation_id)
+        if existing is not None:
+            return existing if existing.state != "RELEASED" else None
+        if self._decode_free_slots.get(instance_id, 0) <= 0:
+            return None
+        self._decode_free_slots[instance_id] -= 1
+        lease = DecodeSlotLease(
+            secrets.token_hex(16), operation_id, req_id, instance_id,
+            "RESERVED", time.monotonic(),
+        )
+        self._slot_leases[operation_id] = lease
+        return lease
+
+    def commit_decode_slot(self, operation_id: str) -> None:
+        lease = self._slot_leases[operation_id]
+        if lease.state == "RESERVED":
+            lease.state = "ACTIVE"
+
+    def release_decode_slot(self, operation_id: str) -> bool:
+        lease = self._slot_leases.get(operation_id)
+        if lease is None or lease.state in {"RELEASED", "QUARANTINED"}:
+            return False
+        if lease.state == "ACTIVE":
+            raise ValueError("cannot rollback an active decode slot")
+        lease.state = "RELEASED"
+        if lease.instance_id in self._decode_free_slots:
+            maximum = self._decode_max_slots[lease.instance_id]
+            self._decode_free_slots[lease.instance_id] = min(
+                maximum, self._decode_free_slots[lease.instance_id] + 1
+            )
+        return True
+
+    def quarantine_decode_slot(self, operation_id: str) -> None:
+        lease = self._slot_leases[operation_id]
+        if lease.state == "RELEASED":
+            raise ValueError("cannot quarantine a released decode slot")
+        lease.state = "QUARANTINED"
+
+    def release_quarantined_decode_slot(self, operation_id: str) -> bool:
+        """Release after an authoritative remote abort proves the slot safe."""
+        lease = self._slot_leases.get(operation_id)
+        if lease is None or lease.state != "QUARANTINED":
+            return False
+        lease.state = "RELEASED"
+        if lease.instance_id in self._decode_free_slots:
+            maximum = self._decode_max_slots[lease.instance_id]
+            self._decode_free_slots[lease.instance_id] = min(
+                maximum, self._decode_free_slots[lease.instance_id] + 1
+            )
+        return True
+
+    def decode_slot_lease(self, operation_id: str) -> DecodeSlotLease | None:
+        return self._slot_leases.get(operation_id)
+
+    def decode_slot_lease_counts(self) -> dict[str, int]:
+        counts = {"RESERVED": 0, "ACTIVE": 0, "QUARANTINED": 0}
+        for lease in self._slot_leases.values():
+            if lease.state in counts:
+                counts[lease.state] += 1
+        return counts
+
     # Feedback from infer layer
 
     def on_prefill_done(
@@ -294,12 +376,24 @@ class PDScheduler:
         return False
 
     def on_decode_finished(
-        self, instance_id: str, assigned_epoch: str | None = None
+        self,
+        instance_id: str,
+        assigned_epoch: str | None = None,
+        operation_id: str | None = None,
     ) -> bool:
         """Release one decode slot if the assigned epoch is still current."""
         if assigned_epoch is not None and not self.epoch_matches(instance_id, assigned_epoch):
             return False
+        if operation_id:
+            lease = self._slot_leases.get(operation_id)
+            if lease is None or lease.instance_id != instance_id \
+                    or lease.state in {"RELEASED", "QUARANTINED"}:
+                return False
+            lease.state = "RELEASED"
         if instance_id in self._decode_free_slots:
+            maximum = self._decode_max_slots[instance_id]
+            if self._decode_free_slots[instance_id] >= maximum:
+                return False
             self._decode_free_slots[instance_id] += 1
             return True
         return False

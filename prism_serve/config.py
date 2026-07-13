@@ -59,6 +59,22 @@ class Settings(BaseSettings):
 
     slot_stale_timeout_s: float = 300.0
 
+    affinity_enabled: bool = False
+    locality_wait_ms: int = 20
+    max_affinity_wait_ms: int = 100
+    affinity_safety_margin_ms: float = 1.0
+    affinity_decode_candidate_limit: int = 8
+    decode_slot_lease_timeout_s: float = 5.0
+    prefix_event_log_capacity: int = 65536
+    prefix_event_poll_interval_ms: int = 100
+    prefix_consumer_lease_s: float = 30.0
+    prefix_full_report_interval_s: float = 300.0
+    prefix_load_timeout_s: float = 5.0
+    suffix_prefill_timeout_s: float = 30.0
+    prefix_operation_watchdog_s: float = 1.0
+    prefix_block_bytes: int = 0
+    prefill_ms_per_token: float = 0.05
+
     min_decode_instances: int = 1
     max_decode_instances: int = 64
     # Usable KV memory per decode instance (bytes); default 56 GB

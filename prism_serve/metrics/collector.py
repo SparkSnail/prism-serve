@@ -12,7 +12,9 @@ logger = logging.getLogger(__name__)
 class NullMetrics:
     """No-op metrics backend used in unit tests."""
 
-    def increment(self, name: str, *, labels: dict | None = None) -> None:
+    def increment(
+        self, name: str, amount: float = 1, *, labels: dict | None = None
+    ) -> None:
         pass
 
     def gauge(self, name: str, value: float, *, labels: dict | None = None) -> None:
@@ -112,6 +114,24 @@ class MetricsCollector:
             "Control-message operations that failed before completion",
             ["operation"],
         )
+        self._prefix_event_gap = Counter(
+            "prefix_event_gap_total", "Prefix event gap or overflow", ["reason"]
+        )
+        self._prefix_full_report = Counter(
+            "prefix_full_report_total", "Prefix full reports", ["reason"]
+        )
+        self._prefix_stale = Counter(
+            "prefix_directory_stale_total", "Stale directory entries rejected"
+        )
+        self._affinity_fallback = Counter(
+            "affinity_fallback_total", "Affinity cold fallbacks", ["reason"]
+        )
+        self._cached_prefix_tokens = Counter(
+            "cached_prefix_tokens_total", "Tokens reused from cached prefixes"
+        )
+        self._suffix_prefill_tokens = Counter(
+            "suffix_prefill_tokens_total", "Suffix tokens prefetched after prefix reuse"
+        )
 
         self._active_reqs = Gauge(
             "active_requests",
@@ -139,6 +159,16 @@ class MetricsCollector:
             "stale_slots_count",
             "Slots held beyond stale_timeout (leak indicator; should be 0)",
         )
+        self._prefix_pins = Gauge("prefix_transfer_pins", "Active prefix transfer pins")
+        self._prefix_pending = Gauge(
+            "prefix_pending_allocations", "Pending target prefix allocations"
+        )
+        self._decode_slot_leases = Gauge(
+            "decode_slot_leases", "Decode slot leases", ["state"]
+        )
+        self._decode_slot_quarantined = Gauge(
+            "decode_slot_quarantined", "Quarantined decode slots"
+        )
 
         self._ttft = Histogram(
             "request_ttft_ms",
@@ -146,17 +176,22 @@ class MetricsCollector:
             ["state"],
             buckets=self.TTFT_BUCKETS,
         )
+        self._cached_prefix_bytes = Histogram(
+            "cached_prefix_transfer_bytes", "Mapped prefix transfer bytes"
+        )
 
-    def increment(self, name: str, *, labels: dict | None = None) -> None:
+    def increment(
+        self, name: str, amount: float = 1, *, labels: dict | None = None
+    ) -> None:
         if not self._available:
             return
         counter = self._counter_map().get(name)
         if counter is None:
             return
         if labels:
-            counter.labels(**labels).inc()
+            counter.labels(**labels).inc(amount)
         else:
-            counter.inc()
+            counter.inc(amount)
 
     def gauge(self, name: str, value: float, *, labels: dict | None = None) -> None:
         if not self._available:
@@ -193,6 +228,18 @@ class MetricsCollector:
                 "decode_abort_total":           self._decode_abort,
                 "control_message_error_total":  self._control_message_error,
             }
+            optional = {
+                "prefix_event_gap_total": "_prefix_event_gap",
+                "prefix_full_report_total": "_prefix_full_report",
+                "prefix_directory_stale_total": "_prefix_stale",
+                "affinity_fallback_total": "_affinity_fallback",
+                "cached_prefix_tokens_total": "_cached_prefix_tokens",
+                "suffix_prefill_tokens_total": "_suffix_prefill_tokens",
+            }
+            self._cm.update({
+                name: getattr(self, attr) for name, attr in optional.items()
+                if hasattr(self, attr)
+            })
         return self._cm
 
     def _gauge_map(self):
@@ -205,6 +252,16 @@ class MetricsCollector:
                 "decode_slot_utilization": self._slot_util,
                 "stale_slots_count":      self._stale_slots,
             }
+            optional = {
+                "prefix_transfer_pins": "_prefix_pins",
+                "prefix_pending_allocations": "_prefix_pending",
+                "decode_slot_leases": "_decode_slot_leases",
+                "decode_slot_quarantined": "_decode_slot_quarantined",
+            }
+            self._gm.update({
+                name: getattr(self, attr) for name, attr in optional.items()
+                if hasattr(self, attr)
+            })
         return self._gm
 
     def _histogram_map(self):
@@ -212,6 +269,8 @@ class MetricsCollector:
             self._hm = {
                 "request_ttft_ms": self._ttft,
             }
+            if hasattr(self, "_cached_prefix_bytes"):
+                self._hm["cached_prefix_transfer_bytes"] = self._cached_prefix_bytes
         return self._hm
 
     def set_infer_client(self, infer_client) -> None:

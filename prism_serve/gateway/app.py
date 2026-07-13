@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI):
         app.state.metrics = NullMetrics()
     metrics_task = asyncio.create_task(app.state.metrics.tick_loop())
 
-    infer_client = _make_stub_infer_client()
+    infer_client = getattr(app.state, "infer_client", None) or _make_stub_infer_client()
     app.state.governor = TransferGovernor(config, infer_client, app.state.metrics)
     if hasattr(app.state.metrics, "set_governor"):
         app.state.metrics.set_governor(app.state.governor)
@@ -70,6 +70,53 @@ async def lifespan(app: FastAPI):
     app.state.scheduler = PDScheduler(config)
     if hasattr(app.state.metrics, "set_scheduler"):
         app.state.metrics.set_scheduler(app.state.scheduler)
+    affinity_coordinator = None
+    reconciler_task = None
+    if config["affinity_enabled"]:
+        from prism_serve.router.coordinator import AffinityCoordinator
+        from prism_serve.router.prefix_index import PrefixIndex
+        from prism_serve.router.reconciler import PrefixReconciler
+        from prism_serve.router.router import AffinityRouter
+        from prism_serve.router.topology import TopologyMatrix
+
+        required = (
+            "resolve_prefix", "prepare_prefix", "transfer_cached_prefix",
+            "commit_cached_prefix", "abort_mapped_prefix", "get_prefix_operation",
+            "abort_cached_prefix", "unpin_prefix", "abort_suffix_prefill",
+            "get_prefix_resource_counts", "full_report_and_register",
+            "peek_events", "ack_events",
+        )
+        missing = [name for name in required if not hasattr(infer_client, name)]
+        if missing:
+            raise RuntimeError(f"affinity RPC client missing capabilities: {missing}")
+        if config["prefix_block_bytes"] <= 0:
+            raise RuntimeError("affinity requires PRISM_SERVE_PREFIX_BLOCK_BYTES > 0")
+        tokenizer_adapter = getattr(app.state, "tokenizer_adapter", None)
+        if tokenizer_adapter is None or not hasattr(
+            tokenizer_adapter, "fingerprint_request"
+        ):
+            raise RuntimeError("affinity requires a process-local TokenizerAdapter")
+        app.state.tokenizer_adapter = tokenizer_adapter
+        app.state.prefix_index = PrefixIndex(config["prefix_location_max_age_s"])
+        topology = getattr(app.state, "topology_matrix", None) or TopologyMatrix()
+        router = AffinityRouter(
+            app.state.prefix_index, topology,
+            block_bytes=config["prefix_block_bytes"],
+            safety_margin_ms=config["affinity_safety_margin_ms"],
+        )
+        affinity_coordinator = AffinityCoordinator(
+            router, infer_client, app.state.queue, config, app.state.metrics
+        )
+        app.state.affinity_coordinator = affinity_coordinator
+        app.state.prefix_reconciler = PrefixReconciler(
+            app.state.prefix_index, infer_client, app.state.queue.owner_id,
+            config["scheduler_generation"], app.state.metrics,
+        )
+        reconciler_task = asyncio.create_task(app.state.prefix_reconciler.run(
+            lambda: app.state.scheduler.decode_instance_epochs().keys(),
+            config["prefix_event_poll_interval_ms"] / 1000.0,
+        ))
+        app.state.reconciler_task = reconciler_task
     loop_task = asyncio.create_task(
         schedule_loop(
             app.state.scheduler,
@@ -78,6 +125,7 @@ async def lifespan(app: FastAPI):
             app.state.queue,
             app.state.metrics,
             config,
+            affinity_coordinator,
         )
     )
     app.state.loop_task = loop_task
@@ -92,6 +140,15 @@ async def lifespan(app: FastAPI):
     logger.info("prism-serve shutting down")
 
     app.state.accepting = False
+
+    if affinity_coordinator is not None:
+        await affinity_coordinator.shutdown()
+    if reconciler_task is not None:
+        reconciler_task.cancel()
+        try:
+            await reconciler_task
+        except asyncio.CancelledError:
+            pass
 
     # Keep scheduling while existing requests and transfer ledgers drain.
     drained = await _wait_for_control_plane_drain(
@@ -278,6 +335,22 @@ def _build_config() -> dict:
         "governor_tick_s":            settings.governor_tick_s,
         "shutdown_drain_timeout_s":   settings.shutdown_drain_timeout_s,
         "slot_stale_timeout_s":       settings.slot_stale_timeout_s,
+        "affinity_enabled":           settings.affinity_enabled,
+        "locality_wait_ms":           settings.locality_wait_ms,
+        "max_affinity_wait_ms":       settings.max_affinity_wait_ms,
+        "affinity_safety_margin_ms":  settings.affinity_safety_margin_ms,
+        "affinity_decode_candidate_limit": settings.affinity_decode_candidate_limit,
+        "decode_slot_lease_timeout_s": settings.decode_slot_lease_timeout_s,
+        "prefix_event_log_capacity":  settings.prefix_event_log_capacity,
+        "prefix_event_poll_interval_ms": settings.prefix_event_poll_interval_ms,
+        "prefix_consumer_lease_s":    settings.prefix_consumer_lease_s,
+        "prefix_full_report_interval_s": settings.prefix_full_report_interval_s,
+        "prefix_location_max_age_s":  2 * settings.prefix_full_report_interval_s,
+        "prefix_load_timeout_s":      settings.prefix_load_timeout_s,
+        "suffix_prefill_timeout_s":   settings.suffix_prefill_timeout_s,
+        "prefix_operation_watchdog_s": settings.prefix_operation_watchdog_s,
+        "prefix_block_bytes":         settings.prefix_block_bytes,
+        "prefill_ms_per_token":       settings.prefill_ms_per_token,
         "min_decode_instances":       settings.min_decode_instances,
         "max_decode_instances":       settings.max_decode_instances,
         "kv_per_instance_bytes":      settings.kv_per_instance_bytes,

@@ -29,6 +29,7 @@ async def schedule_loop(
     queue: "NATSQueue",
     metrics,
     config: dict,
+    affinity_coordinator=None,
 ) -> None:
     """Run scheduling ticks until cancelled."""
     from prism_serve.scheduler.sequence_state import SeqState, TransferTask
@@ -38,6 +39,7 @@ async def schedule_loop(
     prefill_timeout_s: float = config.get("prefill_timeout_s", 30.0)
     recompute_timeout_s: float = config.get("recompute_timeout_s", 30.0)
     decode_timeout_s: float = config.get("decode_timeout_s", 300.0)
+    suffix_prefill_timeout_s: float = config.get("suffix_prefill_timeout_s", 30.0)
     max_dispatch_attempts: int = config.get("max_dispatch_attempts", 3)
     abort_timeout_s: float = config.get("abort_request_timeout_s", 5.0)
     tick_interval_s = config.get("schedule_loop_tick_ms", 10) / 1000.0
@@ -49,6 +51,13 @@ async def schedule_loop(
         # Stop as soon as there are no available P instances (all remaining
         # WAITING requests will be retried next tick).
         for req in list(tracker.iter_by_state(SeqState.WAITING)):
+            if (
+                config.get("affinity_enabled", False)
+                and affinity_coordinator is not None
+                and req.fingerprint is not None
+                and await affinity_coordinator.try_start(req, scheduler, tracker)
+            ):
+                continue
             p = scheduler.pick_prefill_instance(req.req_id)
             if p is None:
                 # No P instance available; leave all WAITING for next tick.
@@ -109,6 +118,38 @@ async def schedule_loop(
                 )
                 await asyncio.shield(cleanup)
                 continue
+
+        for msg in await queue.poll("suffix_prefill_done"):
+            req_id = msg.get("req_id")
+            req = tracker.get(req_id) if req_id is not None else None
+            if (
+                req is None
+                or req.state != SeqState.PREFIX_PREFILLING
+                or msg.get("operation_id") != req.active_operation_id
+                or msg.get("instance_epoch") != req.decode_instance_epoch
+                or not scheduler.epoch_matches(
+                    req.decode_instance, req.decode_instance_epoch
+                )
+            ):
+                continue
+            tracker.transition(req_id, SeqState.DECODING)
+
+        if affinity_coordinator is not None:
+            for req in tracker.get_stuck_suffix_prefills(suffix_prefill_timeout_s):
+                stopped = await affinity_coordinator.abort_suffix(req)
+                if stopped:
+                    released = scheduler.on_decode_finished(
+                        req.decode_instance, req.decode_instance_epoch,
+                        req.active_operation_id,
+                    )
+                    if not released:
+                        scheduler.release_quarantined_decode_slot(
+                            req.active_operation_id
+                        )
+                else:
+                    scheduler.quarantine_decode_slot(req.active_operation_id)
+                tracker.transition(req.req_id, SeqState.ABORTED)
+                tracker.remove(req.req_id)
 
         for req in tracker.get_stuck_prefills(prefill_timeout_s):
             if req.dispatch_attempts >= max_dispatch_attempts:
@@ -408,7 +449,8 @@ async def schedule_loop(
                 continue
             tracker.transition(req_id, SeqState.FINISHED)
             scheduler.on_decode_finished(
-                req.decode_instance, req.decode_instance_epoch
+                req.decode_instance, req.decode_instance_epoch,
+                req.active_operation_id or None,
             )
             governor.finish_request(req_id)
             tracker.remove(req_id)

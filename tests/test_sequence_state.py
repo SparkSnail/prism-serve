@@ -17,6 +17,7 @@ def test_seqstate_all_values():
     names = {s.name for s in SeqState}
     expected = {
         "WAITING", "PREFILLING", "KV_PENDING", "RECOMPUTING",
+        "AFFINITY_LOADING", "PREFIX_PREFILLING",
         "DECODING", "FINISHED", "ABORTED",
     }
     assert names == expected, f"missing states: {expected - names}"

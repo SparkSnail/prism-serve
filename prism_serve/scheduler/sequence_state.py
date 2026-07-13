@@ -14,6 +14,8 @@ class SeqState(Enum):
     PREFILLING = auto()
     KV_PENDING = auto()
     RECOMPUTING = auto()
+    AFFINITY_LOADING = auto()
+    PREFIX_PREFILLING = auto()
     DECODING = auto()
     FINISHED = auto()
     ABORTED = auto()
@@ -27,6 +29,8 @@ class RequestInfo:
     """
     req_id: str
     state: SeqState = SeqState.WAITING
+    fingerprint: object | None = None
+    sampling_params: dict = field(default_factory=dict)
 
     prefill_instance: str = ""
     decode_instance:  str = ""
@@ -47,6 +51,13 @@ class RequestInfo:
     kv_size_bytes: int = 0
     block_table:   list[int] = field(default_factory=list)
     transfer_operation_id: str = ""
+    active_operation_id: str = ""
+    decode_slot_lease_id: str = ""
+    cache_source: str = ""
+    cached_prefix_tokens: int = 0
+    affinity_started_at: float = 0.0
+    prefix_ready_at: float = 0.0
+    suffix_prefill_started_at: float = 0.0
     command_id: str = ""
     publish_outcome: str = "NOT_STARTED"
 
@@ -76,6 +87,11 @@ class RequestInfo:
         if self.state != SeqState.DECODING:
             return False
         return (time.monotonic() - self.decode_start) > timeout_s
+
+    def is_suffix_prefill_stuck(self, timeout_s: float) -> bool:
+        if self.state != SeqState.PREFIX_PREFILLING:
+            return False
+        return (time.monotonic() - self.suffix_prefill_started_at) > timeout_s
 
 
 @dataclass(slots=True)
@@ -123,8 +139,10 @@ class TransferTask:
 def _validate_transition(current: SeqState, new: SeqState) -> None:
     """Reject transitions that skip a control-plane phase."""
     VALID: dict[SeqState, set[SeqState]] = {
-        SeqState.WAITING:    {SeqState.PREFILLING},
+        SeqState.WAITING:    {SeqState.PREFILLING, SeqState.AFFINITY_LOADING},
         SeqState.PREFILLING: {SeqState.KV_PENDING},
+        SeqState.AFFINITY_LOADING: {SeqState.PREFIX_PREFILLING, SeqState.WAITING},
+        SeqState.PREFIX_PREFILLING: {SeqState.DECODING, SeqState.WAITING},
         SeqState.KV_PENDING: {SeqState.DECODING, SeqState.RECOMPUTING},
         SeqState.RECOMPUTING: {SeqState.DECODING},
         SeqState.DECODING:   {SeqState.FINISHED, SeqState.ABORTED},
@@ -195,6 +213,11 @@ class RequestTracker:
             req.dispatch_attempts += 1
         elif new_state == SeqState.KV_PENDING:
             req.kv_sent_at = now
+        elif new_state == SeqState.AFFINITY_LOADING:
+            req.affinity_started_at = now
+        elif new_state == SeqState.PREFIX_PREFILLING:
+            req.prefix_ready_at = now
+            req.suffix_prefill_started_at = now
         elif new_state == SeqState.RECOMPUTING:
             req.recompute_start = now
         elif new_state == SeqState.DECODING:
@@ -235,6 +258,13 @@ class RequestTracker:
             if request.is_decode_stuck(timeout_s)
         ]
         return sorted(stuck, key=lambda request: request.decode_start)
+
+    def get_stuck_suffix_prefills(self, timeout_s: float) -> list[RequestInfo]:
+        stuck = [
+            request for request in self._requests.values()
+            if request.is_suffix_prefill_stuck(timeout_s)
+        ]
+        return sorted(stuck, key=lambda request: request.suffix_prefill_started_at)
 
     def record_first_token(self, req_id: str) -> bool:
         """Record TTFT once for an actively decoding request."""
