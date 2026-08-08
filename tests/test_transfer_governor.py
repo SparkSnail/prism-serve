@@ -1,4 +1,7 @@
 """Unit tests for TransferGovernor (scheduler/transfer_governor.py)."""
+
+from __future__ import annotations
+
 import time
 import pytest
 from unittest.mock import MagicMock, call
@@ -60,6 +63,21 @@ def test_can_send_blocked_by_bytes_cap():
     _set_usage(gov, 0.50)
     gov._bytes_inflight["d-0"] = 200 * 1024 ** 2
     assert not gov.can_send("d-0", 100 * 1024 ** 2)
+
+
+def test_week12_bytes_cap_is_independent_per_pair():
+    gov, infer_client, _ = make_governor(max_bytes=1024 ** 3)
+    _set_usage(gov, 0.50)
+    block_bytes = 29_360_128
+
+    for index in range(36):
+        gov.submit(_task(f"p0-{index}", "d-0", block_bytes))
+    assert gov.bytes_inflight_for_pair("p-0", "d-0") == 36 * block_bytes
+    assert not gov.can_send("d-0", block_bytes, src="p-0")
+
+
+    assert gov.can_send("d-0", block_bytes, src="p-1")
+    assert infer_client.transfer.call_count == 36
 
 
 def test_oversized_task_can_own_idle_destination():

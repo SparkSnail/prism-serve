@@ -1,4 +1,7 @@
 """Unit tests for PDScheduler (scheduler/scheduler.py)."""
+
+from __future__ import annotations
+
 import time
 import pytest
 from prism_serve.scheduler.scheduler import KVUsageSample, PDScheduler
@@ -25,7 +28,33 @@ def _set_usage(scheduler: PDScheduler, instance_id: str, ratio: float) -> None:
     )
 
 
-# register_instance
+class _Registry:
+    def __init__(self):
+        self.fresh = True
+        self.allowed = {"p-0", "d-0"}
+
+    def world_fresh(self):
+        return self.fresh
+
+    def can_route(self, instance_id):
+        return self.fresh and instance_id in self.allowed
+
+
+def test_week12_registry_is_scheduler_admission_authority():
+    registry = _Registry()
+    sch = PDScheduler({}, worker_registry=registry)
+    sch.register_instance("p-0", "prefill")
+    sch.register_instance("d-0", "decode", max_slots=1)
+    _set_usage(sch, "d-0", 0.1)
+
+    assert sch.admission_ready() is True
+    assert sch.pick_prefill_instance("r1") == "p-0"
+    sch.on_prefill_done("p-0")
+    registry.fresh = False
+    assert sch.admission_ready() is False
+    assert sch.pick_prefill_instance("r2") is None
+    assert sch.reserve_decode_slot("d-0", "r2", "op-r2") is None
+
 
 def test_register_prefill():
     sch = make_scheduler()

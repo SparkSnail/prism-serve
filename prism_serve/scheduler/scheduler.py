@@ -44,6 +44,7 @@ class DecodeSlotLease:
     instance_id: str
     state: str
     reserved_at: float
+    release_cleanup_id: str | None = None
 
 
 class QuarantinedInstanceError(ValueError):
@@ -65,8 +66,11 @@ class PDScheduler:
     per-request state tracking (RequestTracker).
     """
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, worker_registry=None) -> None:
         self.config = config
+
+
+        self.worker_registry = worker_registry
 
         # instance_id → queue depth (prefill instances)
         self._prefill_load: dict[str, int] = {}
@@ -250,19 +254,17 @@ class PDScheduler:
 
     # Selection
 
-    def pick_prefill_instance(self, req_id: str) -> str | None:
-        """Select the P instance with the shortest queue (least loaded).
-
-        Returns None if no prefill instance is registered.
-
-        Why not round-robin: queue depth is proportional to actual GPU
-        load for prefill.  A short-queue instance is more likely to start
-        the new request promptly.
-        """
-        if not self._prefill_load:
+    def pick_prefill_instance(
+        self, req_id: str, *, required_instance: str | None = None
+    ) -> str | None:
+        candidates = [
+            instance_id for instance_id in self._prefill_load
+            if self._registry_allows(instance_id)
+            and (required_instance is None or instance_id == required_instance)
+        ]
+        if not candidates:
             return None
-        # O(n_prefill_instances); n is typically < 10 in a single cluster
-        best = min(self._prefill_load, key=lambda k: self._prefill_load[k])
+        best = min(candidates, key=lambda k: self._prefill_load[k])
         self._prefill_load[best] += 1
         return best
 
@@ -270,6 +272,8 @@ class PDScheduler:
         self,
         req_id: str,
         kv_size_bytes: int,
+        *,
+        required_instance: str | None = None,
     ) -> str | None:
         """Pre-select the D instance with the most free slots.
 
@@ -286,7 +290,13 @@ class PDScheduler:
         candidates = [
             (iid, slots)
             for iid, slots in self._decode_free_slots.items()
-            if slots > 0 and self._sample_is_fresh(iid) and self._kv_usage[iid].ratio < high_wm
+            if (
+                slots > 0
+                and self._registry_allows(iid)
+                and self._sample_is_fresh(iid)
+                and self._kv_usage[iid].ratio < high_wm
+                and (required_instance is None or iid == required_instance)
+            )
         ]
         if not candidates:
             return None
@@ -302,12 +312,44 @@ class PDScheduler:
         existing = self._slot_leases.get(operation_id)
         if existing is not None:
             return existing if existing.state != "RELEASED" else None
-        if self._decode_free_slots.get(instance_id, 0) <= 0:
+        if (
+            not self._registry_allows(instance_id)
+            or self._decode_free_slots.get(instance_id, 0) <= 0
+        ):
             return None
         self._decode_free_slots[instance_id] -= 1
         lease = DecodeSlotLease(
             secrets.token_hex(16), operation_id, req_id, instance_id,
             "RESERVED", time.monotonic(),
+        )
+        self._slot_leases[operation_id] = lease
+        return lease
+
+    def admission_ready(self) -> bool:
+        """Whether a new request may start a state transition this tick."""
+        return (
+            self.worker_registry is None
+            or self.worker_registry.world_fresh()
+        )
+
+    def _registry_allows(self, instance_id: str) -> bool:
+        return (
+            self.worker_registry is None
+            or self.worker_registry.can_route(instance_id)
+        )
+
+    def adopt_picked_decode_slot(
+        self, instance_id: str, req_id: str, operation_id: str
+    ) -> DecodeSlotLease:
+        assert operation_id, "decode slot adoption requires operation_id"
+        if operation_id in self._slot_leases:
+            raise ValueError("decode operation already has a slot lease")
+        if instance_id not in self._decode_free_slots:
+            raise ValueError("unknown decode instance")
+        lease = DecodeSlotLease(
+            lease_id=secrets.token_hex(16), operation_id=operation_id,
+            req_id=req_id, instance_id=instance_id, state="RESERVED",
+            reserved_at=time.monotonic(),
         )
         self._slot_leases[operation_id] = lease
         return lease
@@ -337,12 +379,26 @@ class PDScheduler:
             raise ValueError("cannot quarantine a released decode slot")
         lease.state = "QUARANTINED"
 
-    def release_quarantined_decode_slot(self, operation_id: str) -> bool:
-        """Release after an authoritative remote abort proves the slot safe."""
+    def release_quarantined_decode_slot(
+        self,
+        operation_id: str,
+        lease_id: str | None = None,
+        cleanup_id: str | None = None,
+    ) -> bool:
+        """Release only after an authoritative remote abort proves the slot safe."""
         lease = self._slot_leases.get(operation_id)
-        if lease is None or lease.state != "QUARANTINED":
+        if lease is None:
+            return False
+        if lease_id is not None and lease.lease_id != lease_id:
+            raise ValueError("decode slot lease id mismatch")
+        if lease.state == "RELEASED":
+            if cleanup_id is not None and lease.release_cleanup_id != cleanup_id:
+                raise ValueError("released slot replay changed cleanup id")
+            return False
+        if lease.state != "QUARANTINED":
             return False
         lease.state = "RELEASED"
+        lease.release_cleanup_id = cleanup_id
         if lease.instance_id in self._decode_free_slots:
             maximum = self._decode_max_slots[lease.instance_id]
             self._decode_free_slots[lease.instance_id] = min(
@@ -350,8 +406,63 @@ class PDScheduler:
             )
         return True
 
+    def restore_quarantined_decode_slot(
+        self, operation_id: str, lease_id: str, cleanup_id: str
+    ) -> None:
+        """Rollback a replacement transaction before runtime publication."""
+        lease = self._slot_leases[operation_id]
+        if lease.lease_id != lease_id:
+            raise ValueError("decode slot lease id mismatch")
+        if lease.state != "RELEASED" or lease.release_cleanup_id != cleanup_id:
+            raise ValueError("decode slot was not released by this cleanup")
+        lease.state = "QUARANTINED"
+        lease.release_cleanup_id = None
+        if lease.instance_id in self._decode_free_slots:
+            self._decode_free_slots[lease.instance_id] = max(
+                0, self._decode_free_slots[lease.instance_id] - 1
+            )
+
     def decode_slot_lease(self, operation_id: str) -> DecodeSlotLease | None:
         return self._slot_leases.get(operation_id)
+
+    def quarantined_decode_leases(self) -> tuple[DecodeSlotLease, ...]:
+        """Immutable iteration boundary used by whole-world replacement."""
+        return tuple(
+            lease for lease in self._slot_leases.values()
+            if lease.state == "QUARANTINED"
+        )
+
+    def replacement_decode_leases(self) -> tuple[DecodeSlotLease, ...]:
+        """Freeze every old-world lease that can still own decode capacity."""
+        return tuple(
+            lease for lease in self._slot_leases.values()
+            if lease.state in {"RESERVED", "ACTIVE", "QUARANTINED"}
+        )
+
+    def restore_replaced_decode_slot(
+        self,
+        operation_id: str,
+        lease_id: str,
+        cleanup_id: str,
+        previous_state: str,
+    ) -> None:
+        """Rollback a staged whole-world release to its exact frozen state."""
+        if previous_state not in {"RESERVED", "ACTIVE", "QUARANTINED"}:
+            raise ValueError("invalid replacement lease state")
+        lease = self._slot_leases[operation_id]
+        if lease.lease_id != lease_id:
+            raise ValueError("decode slot lease id mismatch")
+        if lease.state == "RELEASED":
+            if lease.release_cleanup_id != cleanup_id:
+                raise ValueError("decode slot was not released by this cleanup")
+            if lease.instance_id in self._decode_free_slots:
+                self._decode_free_slots[lease.instance_id] = max(
+                    0, self._decode_free_slots[lease.instance_id] - 1
+                )
+        elif lease.state != "QUARANTINED":
+            raise ValueError("replacement rollback requires quarantined/released slot")
+        lease.state = previous_state
+        lease.release_cleanup_id = None
 
     def decode_slot_lease_counts(self) -> dict[str, int]:
         counts = {"RESERVED": 0, "ACTIVE": 0, "QUARANTINED": 0}

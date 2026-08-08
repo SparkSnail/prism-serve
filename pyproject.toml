@@ -9,7 +9,7 @@ authors = [{ name = "SparkSnail" }]
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 readme = "README.md"
-description = "Kubernetes control plane for disaggregated LLM serving: KV-affinity routing, predictive autoscaling, stateful rescale"
+description = "Kubernetes control plane for disaggregated LLM serving with PD scheduling and KV-affinity routing"
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.110",
@@ -20,6 +20,7 @@ dependencies = [
     "nats-py>=2.7",
     "prometheus-client>=0.20",
     "xxhash>=3.0",
+    "transformers>=4.51.0",
 ]
 
 [project.optional-dependencies]

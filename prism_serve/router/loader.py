@@ -88,8 +88,13 @@ async def load_cached_prefix(
     decision: CachedPrefixDecision,
     target_epoch: str,
     context: PrefixLoadContext | None = None,
+    defer_source_release: bool = False,
 ) -> CachedPrefixPlan:
-    """Run resolve -> prepare -> mapped copy/local reuse -> commit -> unpin."""
+    """Run resolve -> prepare -> mapped copy/local reuse -> commit.
+
+    Remote SOURCE_PIN release is deliberately owned by the coordinator after
+    commit so suffix execution is not blocked by an ambiguous finalize reply.
+    """
     block_count = decision.cached_prefix_blocks
     expected = [
         ExpectedPrefixBlock(
@@ -178,9 +183,13 @@ async def load_cached_prefix(
     await rpc.commit_cached_prefix(decision.decode_instance, operation_id, plan)
     context.stage = "COMMITTED"
     context.target_pending = False
-    context.changed()
-    await rpc.unpin_prefix(decision.source_instance, operation_id)
-    context.source_pinned = False
+    if mode == "local_reuse":
+        # Engine commit_pinned_prefix atomically converted the pin into the
+        # committed Sequence's block refs; no independent unpin RPC remains.
+        context.source_pinned = False
+    elif not defer_source_release:
+        await rpc.unpin_prefix(decision.source_instance, operation_id)
+        context.source_pinned = False
     context.changed()
     return plan
 

@@ -88,6 +88,37 @@ class PrefixIndex:
             self._add(location)
         self._last_seq[owner] = snapshot_seq_no
 
+    def install_world_full_reports(
+        self,
+        reports: Iterable[tuple[Owner, int, Iterable[CacheLocation]]],
+        *,
+        expected_owners: set[Owner],
+    ) -> None:
+        staged_index: dict[Key, set[CacheLocation]] = defaultdict(set)
+        staged_forward: dict[Owner, set[Key]] = defaultdict(set)
+        staged_last_seq: dict[Owner, int] = {}
+        for owner, snapshot_seq_no, locations in reports:
+            if owner in staged_last_seq:
+                raise ValueError(f"duplicate full report owner: {owner!r}")
+            if type(snapshot_seq_no) is not int or snapshot_seq_no < 0:
+                raise ValueError("full report snapshot sequence must be non-negative")
+            staged_forward[owner]
+            for location in locations:
+                if (location.instance_id, location.instance_epoch) != owner:
+                    raise ValueError("full report owner mismatch")
+                key = self._key(location)
+                staged_index[key].add(location)
+                staged_forward[owner].add(key)
+            staged_last_seq[owner] = snapshot_seq_no
+        if set(staged_last_seq) != expected_owners:
+            raise ValueError("full report world does not match expected owners")
+
+
+
+        self._index = staged_index
+        self._forward = staged_forward
+        self._last_seq = staged_last_seq
+
     def iter_matches(
         self, fingerprint: PromptFingerprint, now: float | None = None
     ) -> Iterator[tuple[int, set[CacheLocation]]]:
@@ -109,6 +140,11 @@ class PrefixIndex:
     def remove_instance(self, instance_id: str) -> None:
         for owner in [owner for owner in self._forward if owner[0] == instance_id]:
             self.remove_owner(owner)
+
+    def clear(self) -> None:
+        self._index = defaultdict(set)
+        self._forward = defaultdict(set)
+        self._last_seq = {}
 
     def remove_owner(self, owner: Owner) -> None:
         for key in list(self._forward.get(owner, set())):

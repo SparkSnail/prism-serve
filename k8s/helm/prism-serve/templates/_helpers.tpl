@@ -31,10 +31,21 @@ app.kubernetes.io/component: worker
 {{- end -}}
 
 {{- define "prism-serve.gateway.image" -}}
-{{- $tag := .Values.gateway.image.tag | default .Chart.AppVersion -}}
+{{- if .Values.gateway.image.digest -}}
+{{- printf "%s@%s" .Values.gateway.image.repository .Values.gateway.image.digest -}}
+{{- else -}}
+{{- $tag := required "gateway.image.tag or gateway.image.digest is required" .Values.gateway.image.tag -}}
+{{- if eq $tag "latest" }}{{ fail "gateway image tag latest is forbidden" }}{{ end -}}
 {{- printf "%s:%s" .Values.gateway.image.repository $tag -}}
+{{- end -}}
 {{- end -}}
 
 {{- define "prism-serve.worker.image" -}}
-{{- printf "%s:%s" .Values.worker.image.repository .Values.worker.image.tag -}}
+{{- if .Values.worker.image.digest -}}
+{{- printf "%s@%s" .Values.worker.image.repository .Values.worker.image.digest -}}
+{{- else -}}
+{{- $tag := required "worker.image.tag or worker.image.digest is required" .Values.worker.image.tag -}}
+{{- if eq $tag "latest" }}{{ fail "worker image tag latest is forbidden" }}{{ end -}}
+{{- printf "%s:%s" .Values.worker.image.repository $tag -}}
+{{- end -}}
 {{- end -}}

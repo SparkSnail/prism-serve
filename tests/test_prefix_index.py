@@ -31,3 +31,18 @@ def test_full_report_epoch_replacement_and_stale_exclusion() -> None:
     fp = PromptFingerprint("ns", "compat", "text", (1, 2, 3, 9, 10), (11,), 4)
     assert list(index.iter_matches(fp, now=24))[0][1] == {new}
     assert list(index.iter_matches(fp, now=26)) == []
+
+
+def test_world_full_report_validation_failure_preserves_old_directory() -> None:
+    index = PrefixIndex(max_age_s=100)
+    old = _location(epoch="old", updated=10)
+    index.install_full_report(("d0", "old"), 4, [old])
+
+    with pytest.raises(ValueError, match="expected owners"):
+        index.install_world_full_reports(
+            [(("d0", "new"), 1, [_location(epoch="new", updated=20)])],
+            expected_owners={("p0", "p-new"), ("d0", "new")},
+        )
+
+    assert index._last_seq == {("d0", "old"): 4}
+    index.assert_consistent()

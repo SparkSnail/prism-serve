@@ -1,4 +1,20 @@
-model: Qwen3-30B-A3B
+# Default values for prism-serve.
+# Fixed 2P2D gateway Deployment, worker StatefulSet, and Service.
+# Advanced templates (KEDA / Volcano gang / PodGroups / standby) land in later weeks.
+
+# Fixed 2P2D profile. All fields are one immutable compatibility unit.
+model:
+  profileId: week12-qwen3-0.6b
+  id: Qwen/Qwen3-0.6B
+  localPath: /opt/models/Qwen3-0.6B
+  revision: 9d4bfd9a94aa5f2ab18d77fa457c306da0b8e439
+  tokenizerRevision: 9d4bfd9a94aa5f2ab18d77fa457c306da0b8e439
+  configSha256: 660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd
+  dtype: bfloat16
+  kvLayout: NHDC
+  tokensPerBlock: 256
+  kvBlockBytes: 29360128
+  kvCompatibilityId: a305c48442086f050a0f703c9e79e6e4596c52eaf5dd9f9015cc1a744c1b5b19
 parallel:
   tp_size: 1
   ep_size: 1
@@ -8,11 +24,24 @@ parallel:
 # Gateway: stateless FastAPI ingress.
 # ---------------------------------------------------------------------------
 gateway:
-  # Scheduler capacity and quarantine state are process-local.
+  # The scheduler ledger is process-local until shared state/leader failover lands.
   replicas: 1
+  terminationGracePeriodSeconds: 255
+  startupProbe:
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 60
+  # Gateway ledger generation changes only through /admin/topology/accept.
+  topologyGeneration: "00000000-0000-4000-8000-000000000001"
+  correctnessHarness:
+    enabled: false
+    secretName: ""
+    secretKey: token
+    faultGateTimeoutSeconds: 1200
   image:
-    repository: ghcr.io/sparksnail/prism-serve
-    tag: ""            # defaults to .Chart.AppVersion
+    repository: sparksnail/prism-serve
+    tag: "week12-unpublished" # override with an immutable source-revision tag
+    digest: ""                 # production: sha256:... takes precedence
     pullPolicy: IfNotPresent
   port: 8080
   resources:
@@ -25,20 +54,52 @@ gateway:
   service:
     type: ClusterIP
     port: 80
+  replacementStore:
+    path: /var/lib/prism/replacement
+    maxRecordsPerRun: 1024
+    sealRetention: 2
+    storageClassName: ""
+    size: 1Gi
 
 # ---------------------------------------------------------------------------
 # Worker: prism-infer engine instances (GPU, stateful).
 # ---------------------------------------------------------------------------
 worker:
   replicas: 1
+  topologyGeneration: "00000000-0000-4000-8000-000000000001"
+  # Fresh install keeps this absent so workers wait before model/NCCL init.
+  # pd-worldctl publishes and later persists the frozen six-field object.
+  startupPermitJson: null
+  # pd-worldctl owns the optimistic-CAS transition; Helm only persists it.
+  initializationStateJson:
+    phase: UNINITIALIZED
+  rendezvousPort: 29500
+  requireGpudirectRdma: false
+  ncclWatchdogTimeoutSeconds: 30
+  maxBytesInflightPerPair: 1073741824
+  nccl:
+    socketIfname: eth0
+    ibDisable: true
+    p2pDisable: true
+    shmDisable: true
+    debugSubsystems: INIT,NET
+  members:
+    - {name: p0, role: prefill, globalRank: 0, nodeGroup: a}
+    - {name: p1, role: prefill, globalRank: 1, nodeGroup: b}
+    - {name: d0, role: decode, globalRank: 2, nodeGroup: a}
+    - {name: d1, role: decode, globalRank: 3, nodeGroup: b}
+  nodeGroups:
+    a: {prism.sparksnail.ai/pd-node-group: a}
+    b: {prism.sparksnail.ai/pd-node-group: b}
   image:
-    repository: ghcr.io/sparksnail/prism-infer
-    tag: "latest"
+    repository: sparksnail/prism-infer
+    tag: "week12-unpublished" # override with an immutable source-revision tag
+    digest: ""                 # production: sha256:... takes precedence
     pullPolicy: IfNotPresent
-  port: 8000
+  port: 8001
   gpu:
     count: 1
-    type: a100-80g     # maps to a nodeSelector label
+    type: a100-80g     # documentation only; scheduling uses nodeGroups labels
   resources:
     requests:
       cpu: "4"
@@ -58,6 +119,10 @@ redis:
   url: redis://redis:6379/0
 nats:
   url: nats://nats:4222
+
+# Prefix-affinity remains opt-in until its external GPU evidence gate passes.
+affinity:
+  enabled: false
 
 imagePullSecrets: []
 nodeSelector: {}

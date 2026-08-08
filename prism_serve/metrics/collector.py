@@ -132,6 +132,40 @@ class MetricsCollector:
         self._suffix_prefill_tokens = Counter(
             "suffix_prefill_tokens_total", "Suffix tokens prefetched after prefix reuse"
         )
+        self._output_gap_repair = Counter(
+            "output_gap_repair_total", "Cumulative output gaps repaired", ["source"]
+        )
+        self._infer_rpc_requests = Counter(
+            "infer_rpc_requests_total", "Infer HTTP RPC calls", ["endpoint", "status"]
+        )
+        self._infer_rpc_ambiguous = Counter(
+            "infer_rpc_ambiguous_total", "Ambiguous infer RPC outcomes", ["reason"]
+        )
+        self._worker_epoch_change = Counter(
+            "worker_epoch_change_total", "Observed worker epoch changes", ["instance"]
+        )
+        self._pd_world_restart = Counter(
+            "pd_world_restart_total", "Whole-world restart outcomes", ["outcome", "reason"]
+        )
+        self._operation_stale = Counter(
+            "operation_stale_total", "Rejected stale operations", ["endpoint", "reason"]
+        )
+        self._operation_cancelled_before_arrival = Counter(
+            "operation_cancelled_before_arrival_total",
+            "Operations terminalized before command arrival", ["endpoint", "publish_outcome"]
+        )
+        self._cleanup_finalize = Counter(
+            "cleanup_finalize_total", "Endpoint terminal finalize", ["endpoint", "status"]
+        )
+        self._cleanup_finalize_replay = Counter(
+            "cleanup_finalize_replay_total", "Finalize snapshot replay", ["endpoint"]
+        )
+        self._cleanup_replacement_record = Counter(
+            "cleanup_replacement_record_total", "Replacement release records", ["outcome"]
+        )
+        self._cleanup_replacement_replay = Counter(
+            "cleanup_replacement_record_replay_total", "Replacement record replay", ["outcome"]
+        )
 
         self._active_reqs = Gauge(
             "active_requests",
@@ -160,15 +194,16 @@ class MetricsCollector:
             "Slots held beyond stale_timeout (leak indicator; should be 0)",
         )
         self._prefix_pins = Gauge("prefix_transfer_pins", "Active prefix transfer pins")
-        self._prefix_pending = Gauge(
-            "prefix_pending_allocations", "Pending target prefix allocations"
-        )
-        self._decode_slot_leases = Gauge(
-            "decode_slot_leases", "Decode slot leases", ["state"]
-        )
-        self._decode_slot_quarantined = Gauge(
-            "decode_slot_quarantined", "Quarantined decode slots"
-        )
+        self._prefix_pending = Gauge("prefix_pending_allocations", "Pending target prefix allocations")
+        self._decode_slot_leases = Gauge("decode_slot_leases", "Decode slot leases", ["state"])
+        self._decode_slot_quarantined = Gauge("decode_slot_quarantined", "Quarantined decode slots")
+        self._pd_topology_state = Gauge("pd_topology_state", "PD topology state", ["state"])
+        self._cleanup_resources_held = Gauge("cleanup_resources_held", "Held cleanup resources", ["instance", "resource_kind"])
+        self._resource_report_age = Gauge("resource_report_age_seconds", "Gateway-local resource report age", ["instance"])
+        self._pair_capability_ready = Gauge("pair_capability_ready", "Pair capability readiness", ["pair", "transport"])
+        self._transfer_quarantined_bytes = Gauge("transfer_quarantined_bytes", "Quarantined transfer bytes", ["pair"])
+        self._transfer_quarantined_operations = Gauge("transfer_quarantined_operations", "Quarantined transfer operations", ["reason"])
+        self._orphan_operations = Gauge("orphan_operations", "Old-owner operations", ["instance"])
 
         self._ttft = Histogram(
             "request_ttft_ms",
@@ -178,6 +213,16 @@ class MetricsCollector:
         )
         self._cached_prefix_bytes = Histogram(
             "cached_prefix_transfer_bytes", "Mapped prefix transfer bytes"
+        )
+        self._gateway_first_token_stage = Histogram(
+            "gateway_first_token_stage_latency_ms", "Gateway admission to first token", ["path"],
+            buckets=self.TTFT_BUCKETS,
+        )
+        self._nccl_transfer_latency = Histogram(
+            "nccl_transfer_latency_ms", "Measured NCCL transfer latency", ["pair", "path"]
+        )
+        self._nccl_transfer_bytes = Counter(
+            "nccl_transfer_bytes", "Completed NCCL transfer bytes", ["pair", "path"]
         )
 
     def increment(
@@ -235,6 +280,18 @@ class MetricsCollector:
                 "affinity_fallback_total": "_affinity_fallback",
                 "cached_prefix_tokens_total": "_cached_prefix_tokens",
                 "suffix_prefill_tokens_total": "_suffix_prefill_tokens",
+                "output_gap_repair_total": "_output_gap_repair",
+                "infer_rpc_requests_total": "_infer_rpc_requests",
+                "infer_rpc_ambiguous_total": "_infer_rpc_ambiguous",
+                "worker_epoch_change_total": "_worker_epoch_change",
+                "pd_world_restart_total": "_pd_world_restart",
+                "operation_stale_total": "_operation_stale",
+                "operation_cancelled_before_arrival_total": "_operation_cancelled_before_arrival",
+                "cleanup_finalize_total": "_cleanup_finalize",
+                "cleanup_finalize_replay_total": "_cleanup_finalize_replay",
+                "cleanup_replacement_record_total": "_cleanup_replacement_record",
+                "cleanup_replacement_record_replay_total": "_cleanup_replacement_replay",
+                "nccl_transfer_bytes": "_nccl_transfer_bytes",
             }
             self._cm.update({
                 name: getattr(self, attr) for name, attr in optional.items()
@@ -257,6 +314,13 @@ class MetricsCollector:
                 "prefix_pending_allocations": "_prefix_pending",
                 "decode_slot_leases": "_decode_slot_leases",
                 "decode_slot_quarantined": "_decode_slot_quarantined",
+                "pd_topology_state": "_pd_topology_state",
+                "cleanup_resources_held": "_cleanup_resources_held",
+                "resource_report_age_seconds": "_resource_report_age",
+                "pair_capability_ready": "_pair_capability_ready",
+                "transfer_quarantined_bytes": "_transfer_quarantined_bytes",
+                "transfer_quarantined_operations": "_transfer_quarantined_operations",
+                "orphan_operations": "_orphan_operations",
             }
             self._gm.update({
                 name: getattr(self, attr) for name, attr in optional.items()
@@ -271,6 +335,10 @@ class MetricsCollector:
             }
             if hasattr(self, "_cached_prefix_bytes"):
                 self._hm["cached_prefix_transfer_bytes"] = self._cached_prefix_bytes
+            if hasattr(self, "_gateway_first_token_stage"):
+                self._hm["gateway_first_token_stage_latency_ms"] = self._gateway_first_token_stage
+            if hasattr(self, "_nccl_transfer_latency"):
+                self._hm["nccl_transfer_latency_ms"] = self._nccl_transfer_latency
         return self._hm
 
     def set_infer_client(self, infer_client) -> None:

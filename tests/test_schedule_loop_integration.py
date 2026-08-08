@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict
 import time
 from unittest.mock import AsyncMock, MagicMock
 
@@ -10,7 +11,12 @@ import pytest
 
 from prism_serve.metrics.collector import NullMetrics
 from prism_serve.gateway.app import _abort_remaining_requests
-from prism_serve.scheduler.main_loop import schedule_loop
+from prism_serve.router.http_rpc import EndpointSequenceAllocator
+from prism_serve.scheduler.main_loop import (
+    InjectedNATSCommandFault,
+    _publish_command_with_fault,
+    schedule_loop,
+)
 from prism_serve.scheduler.main_loop import _abort_remote_request
 from prism_serve.scheduler.main_loop import (
     CleanupProof,
@@ -19,6 +25,7 @@ from prism_serve.scheduler.main_loop import (
     d_slot_releasable,
     p_load_releasable,
     validate_cleanup_proof,
+    _canonical_cleanup,
     _trigger_recompute_epoch_fenced,
 )
 from prism_serve.scheduler.queue import NATSQueue
@@ -27,6 +34,64 @@ from prism_serve.scheduler.sequence_state import (
     RequestInfo, RequestTracker, SeqState, TransferTask,
 )
 from prism_serve.scheduler.transfer_governor import TransferGovernor
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fault_kind", "expected_publish_count"),
+    [("nats_drop", 0), ("nats_duplicate", 2), ("nats_publish_unknown", 1)],
+)
+async def test_nats_command_fault_uses_exact_envelope_and_reports_actual_count(
+    fault_kind: str,
+    expected_publish_count: int,
+) -> None:
+    queue = MagicMock()
+    queue.publish = AsyncMock()
+    command = {
+        "schema_version": 1,
+        "endpoint_ref": {
+            "owner_generation": "gateway-1",
+            "operation_seq": 7,
+            "target_instance": "p0",
+            "target_worker_epoch": "p0-e1",
+            "operation_id": "request-1",
+            "payload_digest": "sha256:exact",
+            "topology_generation": "world-1",
+        },
+        "payload": {"req_id": "request-1"},
+    }
+    events: list[tuple[str, dict[str, object]]] = []
+    observe = AsyncMock(return_value={
+        "delivery_count": expected_publish_count,
+        "execution_count": 1 if expected_publish_count else 0,
+    })
+
+    with pytest.raises(InjectedNATSCommandFault):
+        await _publish_command_with_fault(
+            queue,
+            "dispatch_prefill.p0",
+            command,
+            {"fault_kind": fault_kind},
+            lambda name, details: events.append((name, details)),
+            observe,
+        )
+
+    assert queue.publish.await_count == expected_publish_count
+    assert all(call.args == ("dispatch_prefill.p0", command)
+               for call in queue.publish.await_args_list)
+    assert events == [("fault_injected", {
+        "fault_kind": fault_kind,
+        "operation_id": "request-1",
+        "endpoint_ref": command["endpoint_ref"],
+        "subject": "dispatch_prefill.p0",
+        "publish_count": expected_publish_count,
+        "delivery_count": expected_publish_count,
+        "execution_count": 1 if expected_publish_count else 0,
+    })]
+    if fault_kind == "nats_drop":
+        observe.assert_not_awaited()
+    else:
+        observe.assert_awaited_once_with(command["endpoint_ref"], fault_kind)
 
 
 DEFAULT_CONFIG = {
@@ -124,6 +189,49 @@ def test_cleanup_proof_rejects_na_transfer_combination():
     )
     with pytest.raises(ValueError, match="invalid cleanup proof"):
         validate_cleanup_proof(proof)
+
+
+@pytest.mark.asyncio
+async def test_unknown_cleanup_keeps_pair_credit_until_remote_release_proof():
+    scheduler, governor, tracker, _, _, _ = make_components()
+    req = RequestInfo(
+        req_id="R-unknown",
+        state=SeqState.KV_PENDING,
+        decode_instance="d-0",
+        decode_instance_epoch="d-epoch",
+        transfer_operation_id="op-transfer",
+    )
+    tracker.add(req)
+    task = TransferTask(
+        req_id=req.req_id,
+        src="p-0",
+        dst="d-0",
+        kv_size=28 * 1024**2,
+        operation_id=req.transfer_operation_id,
+    )
+    governor._inflight_tasks[req.req_id] = task
+    governor._pair_bytes_inflight["p-0--d-0"] = task.kv_size
+    governor._bytes_inflight["d-0"] = task.kv_size
+    governor.infer_client = MagicMock(
+        week12_network_control=True,
+        cleanup_request=AsyncMock(return_value=False),
+    )
+
+    await _canonical_cleanup(
+        req,
+        tracker,
+        scheduler,
+        governor,
+        "gateway:owner",
+        0.01,
+        0.01,
+    )
+
+    assert tracker.get(req.req_id) is req
+    assert req.state == SeqState.ABORTED
+    assert governor.owns(req.req_id, req.transfer_operation_id)
+    assert governor.bytes_inflight_for_pair("p-0", "d-0") == task.kv_size
+    assert governor.bytes_inflight("d-0") == task.kv_size
 
 
 @pytest.mark.asyncio
@@ -282,6 +390,26 @@ async def test_schedule_loop_uses_configured_tick_interval(monkeypatch):
 
     assert delays
     assert 0.100 < delays[0] <= 0.123
+
+
+@pytest.mark.asyncio
+async def test_schedule_loop_default_tick_is_exactly_ten_milliseconds(monkeypatch):
+    config = {**DEFAULT_CONFIG, "schedule_loop_tick_ms": 10}
+    scheduler, governor, tracker, queue, metrics, _ = make_components(config)
+    delays = []
+
+    async def capture_sleep(delay):
+        delays.append(delay)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        "prism_serve.scheduler.main_loop.time.monotonic", lambda: 0.0,
+    )
+    monkeypatch.setattr(asyncio, "sleep", capture_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await schedule_loop(scheduler, governor, tracker, queue, metrics, config)
+
+    assert delays == [10 / 1000.0]
 
 
 async def drive_loop(
@@ -938,8 +1066,12 @@ async def test_prefill_timeout_retries_same_assignment_then_aborts():
         published.append((subject, data))
 
     queue.publish = capture_publish
+    allocator = EndpointSequenceAllocator("world-a", queue.owner_id)
     task = asyncio.create_task(
-        schedule_loop(scheduler, governor, tracker, queue, metrics, config)
+        schedule_loop(
+            scheduler, governor, tracker, queue, metrics, config,
+            operation_allocator=allocator,
+        )
     )
     try:
         for _ in range(100):
@@ -958,16 +1090,59 @@ async def test_prefill_timeout_retries_same_assignment_then_aborts():
     assert [subject for subject, _ in published] == [
         "dispatch_prefill.p-0", "dispatch_prefill.p-0",
     ]
-    command_ids = {data["command_id"] for _, data in published}
+    assert all(data["schema_version"] == 1 for _, data in published)
+    assert published[0][1]["endpoint_ref"] == published[1][1]["endpoint_ref"]
+    assert published[0][1]["payload"] == published[1][1]["payload"]
+    payloads = [data["payload"] for _, data in published]
+    command_ids = {data["command_id"] for data in payloads}
     assert len(command_ids) == 1
     assert next(iter(command_ids)).endswith(":R1")
-    assert all(data["instance_id"] == "p-0" for _, data in published)
+    assert all(data["instance_id"] == "p-0" for data in payloads)
     assert all(data["first_token_subject"].startswith("first_token.")
-               for _, data in published)
+               for data in payloads)
     assert all(data["recompute_done_subject"].startswith("recompute_done.")
-               for _, data in published)
+               for data in payloads)
     assert scheduler.prefill_queue_depths() == {"p-0": 0}
     assert scheduler.decode_free_slots() == {"d-0": 1}
+
+
+@pytest.mark.asyncio
+async def test_cold_dispatch_uses_versioned_endpoint_envelope():
+    config = {**DEFAULT_CONFIG, "prefill_timeout_s": 10.0}
+    scheduler, governor, tracker, queue, metrics, _ = make_components(config)
+    scheduler.register_instance("p-0", "prefill", instance_epoch="p-pod:boot")
+    scheduler.register_instance(
+        "d-0", "decode", max_slots=1, instance_epoch="d-pod:boot"
+    )
+    request = RequestInfo(req_id="R1", token_ids=[1, 2], sampling_params={})
+    tracker.add(request)
+    published = []
+
+    async def capture_publish(subject, data):
+        published.append((subject, data))
+
+    queue.publish = capture_publish
+    allocator = EndpointSequenceAllocator("world-a", queue.owner_id)
+    task = asyncio.create_task(schedule_loop(
+        scheduler, governor, tracker, queue, metrics, config,
+        operation_allocator=allocator,
+    ))
+    try:
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if published:
+                break
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    command = published[0][1]
+    assert command["schema_version"] == 1
+    assert command["endpoint_ref"]["target_worker_epoch"] == "p-pod:boot"
+    assert command["endpoint_ref"]["operation_id"] == "R1"
+    assert command["payload"]["token_ids"] == [1, 2]
+    assert request.dispatch_operation_ref.operation_seq == 1
 
 
 @pytest.mark.asyncio
@@ -1207,6 +1382,121 @@ async def test_dispatch_publish_response_loss_quarantines_and_terminates():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fault_kind", "expected_publish_count"),
+    [("nats_drop", 0), ("nats_duplicate", 2), ("nats_publish_unknown", 1)],
+)
+async def test_command_fault_dispatch_is_unknown_and_uses_canonical_cleanup(
+    fault_kind: str,
+    expected_publish_count: int,
+) -> None:
+    scheduler, governor, tracker, queue, metrics, infer_client = make_components()
+    scheduler.register_instance("p-0", "prefill", instance_epoch="p-e1")
+    scheduler.register_instance("d-0", "decode", max_slots=1, instance_epoch="d-e1")
+    request = RequestInfo(
+        req_id="R1",
+        kv_size_bytes=KV_SIZE_1BLOCK,
+        correctness_path="cold",
+    )
+    tracker.add(request)
+    published: list[tuple[str, dict[str, object]]] = []
+
+    async def capture_publish(subject, command):
+        published.append((subject, command))
+
+    queue.publish = capture_publish
+    infer_client.correctness_fault_checkpoint = AsyncMock(return_value={
+        "fault_kind": fault_kind,
+        "state": "RELEASED",
+    })
+    infer_client.record_correctness_fault_event = MagicMock()
+    infer_client.wait_nats_command_fault_authority = AsyncMock(return_value={
+        "delivery_count": expected_publish_count,
+        "execution_count": 1 if expected_publish_count else 0,
+    })
+    allocator = EndpointSequenceAllocator("world-a", queue.owner_id)
+    task = asyncio.create_task(schedule_loop(
+        scheduler,
+        governor,
+        tracker,
+        queue,
+        metrics,
+        DEFAULT_CONFIG,
+        operation_allocator=allocator,
+    ))
+    try:
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if "R1" not in tracker:
+                break
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert request.publish_outcome == "UNKNOWN"
+    assert "R1" not in tracker
+    assert scheduler.quarantine_record("p-0") is not None
+    assert scheduler.decode_free_slots()["d-0"] == 1
+    assert len(published) == expected_publish_count
+    assert all(subject == "dispatch_prefill.p-0" for subject, _ in published)
+    assert all(command is published[0][1] for _, command in published) if published else True
+    event = infer_client.record_correctness_fault_event.call_args.args
+    assert event[0] == "fault_injected"
+    assert event[1]["fault_kind"] == fault_kind
+    assert event[1]["publish_count"] == expected_publish_count
+    assert event[1]["delivery_count"] == expected_publish_count
+    assert event[1]["execution_count"] == (1 if expected_publish_count else 0)
+    assert event[1]["endpoint_ref"] == asdict(request.dispatch_operation_ref)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_waits_for_worker_authority_before_abort_can_win() -> None:
+    scheduler, governor, tracker, queue, metrics, infer_client = make_components()
+    scheduler.register_instance("p-0", "prefill", instance_epoch="p-e1")
+    scheduler.register_instance("d-0", "decode", max_slots=1, instance_epoch="d-e1")
+    request = RequestInfo(
+        req_id="R1", kv_size_bytes=KV_SIZE_1BLOCK, correctness_path="cold"
+    )
+    tracker.add(request)
+    observed = asyncio.Event()
+    release_observation = asyncio.Event()
+
+    async def wait_authority(_endpoint_ref, _fault_kind):
+        observed.set()
+        await release_observation.wait()
+        return {"delivery_count": 2, "execution_count": 1}
+
+    queue.publish = AsyncMock()
+    infer_client.correctness_fault_checkpoint = AsyncMock(return_value={
+        "fault_kind": "nats_duplicate", "state": "RELEASED",
+    })
+    infer_client.wait_nats_command_fault_authority = wait_authority
+    infer_client.record_correctness_fault_event = MagicMock()
+    task = asyncio.create_task(schedule_loop(
+        scheduler, governor, tracker, queue, metrics, DEFAULT_CONFIG,
+        operation_allocator=EndpointSequenceAllocator("world-a", queue.owner_id),
+    ))
+    await asyncio.wait_for(observed.wait(), 1.0)
+
+    assert tracker.get("R1") is request
+    assert request.publish_outcome == "NOT_STARTED"
+    infer_client.abort_request.assert_not_awaited()
+
+    release_observation.set()
+    for _ in range(100):
+        await asyncio.sleep(0)
+        if "R1" not in tracker:
+            break
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert request.publish_outcome == "UNKNOWN"
+    infer_client.abort_request.assert_awaited()
+
+
+@pytest.mark.asyncio
 async def test_prefill_publish_cancelled_is_visible_to_shutdown():
     scheduler, governor, tracker, queue, metrics, _ = make_components()
     scheduler.register_instance("p-0", "prefill")
@@ -1318,6 +1608,69 @@ async def test_old_epoch_decode_done_and_timeout_cannot_mutate_reconciled_capaci
     assert scheduler.decode_free_slots()["d-0"] == 2
     assert scheduler.quarantine_record("d-0") is None
     infer_client.abort_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state", [SeqState.PREFIX_PREFILLING, SeqState.KV_PENDING],
+)
+async def test_malformed_decode_progress_does_not_query_before_decode(state):
+    from prism_serve.gateway.output import GatewayOutputBuffer
+
+    scheduler, governor, tracker, queue, metrics, infer_client = make_components()
+    scheduler.register_instance(
+        "d-0", "decode", max_slots=1, instance_epoch="d-e1"
+    )
+    infer_client.week12_network_control = True
+    infer_client.request_output = AsyncMock(return_value={
+        "req_id": "R1",
+        "instance_epoch": "d-e1",
+        "operation_id": "op-1",
+        "output_seq_no": 0,
+        "token_ids": [],
+        "terminal": False,
+    })
+    now = time.monotonic()
+    tracker.add(RequestInfo(
+        req_id="R1",
+        state=state,
+        decode_instance="d-0",
+        decode_instance_epoch="d-e1",
+        active_operation_id="op-1",
+        transfer_operation_id="op-1",
+        kv_sent_at=now,
+        suffix_prefill_started_at=now,
+    ))
+    output = GatewayOutputBuffer()
+    await queue._put_mock("decode_progress", {
+        "req_id": "R1",
+        "instance_epoch": "d-e1",
+        "operation_id": "op-1",
+        "output_seq_no": 2,
+        "token_ids": [7],
+    })
+
+    task = asyncio.create_task(schedule_loop(
+        scheduler,
+        governor,
+        tracker,
+        queue,
+        metrics,
+        DEFAULT_CONFIG,
+        output_buffer=output,
+    ))
+    try:
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if queue._inbox["decode_progress"].empty():
+                break
+        assert queue._inbox["decode_progress"].empty()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    infer_client.request_output.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -49,7 +49,6 @@ class NATSQueue:
         self._nc = await nats.connect(
             self._url,
             connect_timeout=self._connect_timeout_s,
-            retry_on_failed_connect=False,
             max_reconnect_attempts=self._max_reconnect_attempts,
         )
         await self._nc.subscribe(
@@ -69,6 +68,15 @@ class NATSQueue:
             cb=self._make_handler("first_token"),
         )
         await self._nc.subscribe(
+            self.reply_subject("suffix_prefill_done"),
+            cb=self._make_handler("suffix_prefill_done"),
+        )
+        await self._nc.subscribe(
+            self.reply_subject("decode_progress"),
+            cb=self._make_handler("decode_progress"),
+        )
+
+        await self._nc.subscribe(
             "kv_usage.*",
             cb=self._make_handler("kv_usage"),
         )
@@ -84,14 +92,28 @@ class NATSQueue:
             return True
         return bool(self._nc is not None and self._nc.is_connected)
 
+    @property
+    def is_permanently_closed(self) -> bool:
+        """Return whether this client cannot reconnect without a process restart."""
+        if self._use_mock:
+            return False
+        return self._nc is None or bool(getattr(self._nc, "is_closed", False))
+
     def dispatch_subject(self, instance_id: str) -> str:
         _validate_subject_token(instance_id, "instance_id")
         return f"dispatch_prefill.{instance_id}"
 
+    def dispatch_suffix_subject(self, instance_id: str) -> str:
+        _validate_subject_token(instance_id, "instance_id")
+        return f"dispatch_suffix.{instance_id}"
+
     def reply_subject(self, event: str) -> str:
         assert event in {
             "prefill_done", "decode_done", "recompute_done", "first_token",
-        }, f"unsupported completion event: {event!r}"
+            "suffix_prefill_done", "decode_progress",
+        }, (
+            f"unsupported completion event: {event!r}"
+        )
         return f"{event}.{self._owner_id}"
 
     async def close(self) -> None:

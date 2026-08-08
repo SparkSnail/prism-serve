@@ -31,11 +31,61 @@ class Settings(BaseSettings):
 
     engine_endpoint: str = "http://localhost:8000"
 
-    # Separate thresholds prevent flow-control oscillation.
+
+    multinode_e2e_enabled: bool = False
+    worker_topology_path: str = ""
+    topology_generation: str = ""
+    infer_rpc_timeout_s: float = 5.0
+    operation_query_interval_ms: int = 100
+    active_operation_cap: int = 512
+    operation_reorder_window: int = 4096
+    terminal_snapshot_cap: int = 4096
+    replacement_store_path: str = ""
+    replacement_store_max_records_per_run: int = 1024
+    replacement_store_seal_retention: int = 2
+
+    # Kubernetes Secret; it is never accepted from a request body or chart value.
+    correctness_harness_enabled: bool = False
+    correctness_harness_secret: str = ""
+    correctness_fault_gate_timeout_s: float = 1200.0
+    resource_report_stale_after_s: float = 2.0
+    transfer_abort_timeout_s: float = 5.0
+    nccl_watchdog_timeout_s: float = 30.0
+    require_gpudirect_rdma: bool = False
+    allowed_fallback_transport: str = "NCCL_SOCKET"
+    model_profile_id: str = "week12-qwen3-0.6b"
+    model_id: str = "Qwen/Qwen3-0.6B"
+    model_revision: str = "9d4bfd9a94aa5f2ab18d77fa457c306da0b8e439"
+    model_config_sha256: str = (
+        "660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd"
+    )
+    runtime_dtype: str = "bfloat16"
+    tensor_parallel_size: int = 1
+    kv_layout: str = "NHDC"
+    kv_block_bytes: int = 29_360_128
+    model_num_hidden_layers: int = 28
+    model_num_key_value_heads: int = 8
+    model_head_dim: int = 128
+    model_rope_theta: float = 1_000_000.0
+    tokenizer_model: str = ""
+    tokenizer_revision: str = "9d4bfd9a94aa5f2ab18d77fa457c306da0b8e439"
+    chat_template_version: str = "v1"
+    kv_compatibility_id: str = (
+        "a305c48442086f050a0f703c9e79e6e4596c52eaf5dd9f9015cc1a744c1b5b19"
+    )
+    prefix_block_size: int = 256
+
+
+
+
     high_watermark: float = 0.85
     low_watermark:  float = 0.70
 
-    # Per-dst in-flight byte cap (secondary guard, bytes)
+
+    max_bytes_inflight_per_pair: int = 1024 * 1024 * 1024
+
+
+
     max_bytes_inflight: int = 256 * 1024 * 1024  # 256 MB
 
     # ── recompute fallback ───────────────────────────────────────────────

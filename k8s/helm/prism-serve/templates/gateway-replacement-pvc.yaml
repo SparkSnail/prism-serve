@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "prism-serve.fullname" . }}-replacement-store
+  labels:
+    {{- include "prism-serve.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.gateway.replacementStore.size | quote }}
+  {{- with .Values.gateway.replacementStore.storageClassName }}
+  storageClassName: {{ . | quote }}
+  {{- end }}

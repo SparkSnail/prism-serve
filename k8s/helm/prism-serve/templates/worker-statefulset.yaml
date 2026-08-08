@@ -1,66 +1,205 @@
+{{- $expected := list "p0" "p1" "d0" "d1" -}}
+{{- if ne (len .Values.worker.members) 4 -}}
+{{- fail "fixed 2P2D worker world must contain exactly p0,p1,d0,d1" -}}
+{{- end -}}
+{{- if and (ne (int .Values.worker.replicas) 0) (ne (int .Values.worker.replicas) 1) -}}{{ fail "each fixed 2P2D member must have zero or one replica" }}{{- end -}}
+{{- if ne (int .Values.gateway.replicas) 1 -}}{{ fail "fixed 2P2D profile requires one active Gateway" }}{{- end -}}
+{{- if ne (int .Values.parallel.tp_size) 1 -}}{{ fail "fixed 2P2D profile requires TP=1" }}{{- end -}}
+{{- if ne .Values.model.profileId "week12-qwen3-0.6b" -}}{{ fail "unsupported fixed 2P2D model profile" }}{{- end -}}
+{{- if ne (int .Values.gateway.replacementStore.maxRecordsPerRun) 1024 -}}{{ fail "replacement record cap must be 1024" }}{{- end -}}
+{{- if ne (int .Values.gateway.replacementStore.sealRetention) 2 -}}{{ fail "replacement seal retention must be 2" }}{{- end -}}
+{{- range $index, $member := .Values.worker.members }}
+{{- if ne $member.name (index $expected $index) -}}
+{{- fail "fixed 2P2D worker members must be ordered p0,p1,d0,d1" -}}
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "prism-serve.fullname" $ }}-{{ $member.name }}
+  labels:
+    {{- include "prism-serve.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: worker
+    prism.sparksnail.ai/member: {{ $member.name }}
+spec:
+  clusterIP: None
+  # torch.distributed rendezvous must resolve p0 before its HTTP readiness gate.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "prism-serve.worker.selectorLabels" $ | nindent 4 }}
+    prism.sparksnail.ai/member: {{ $member.name }}
+  ports:
+    - name: rpc
+      port: {{ $.Values.worker.port }}
+      targetPort: rpc
+    - name: rendezvous
+      port: {{ $.Values.worker.rendezvousPort }}
+      targetPort: rendezvous
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "prism-serve.fullname" . }}-worker
+  name: {{ include "prism-serve.fullname" $ }}-{{ $member.name }}
   labels:
-    {{- include "prism-serve.labels" . | nindent 4 }}
+    {{- include "prism-serve.labels" $ | nindent 4 }}
     app.kubernetes.io/component: worker
+    prism.sparksnail.ai/member: {{ $member.name }}
 spec:
-  serviceName: {{ include "prism-serve.fullname" . }}-worker
-  replicas: {{ .Values.worker.replicas }}
+  serviceName: {{ include "prism-serve.fullname" $ }}-{{ $member.name }}
+  replicas: {{ $.Values.worker.replicas }}
+  updateStrategy:
+    type: OnDelete
   selector:
     matchLabels:
-      {{- include "prism-serve.worker.selectorLabels" . | nindent 6 }}
+      {{- include "prism-serve.worker.selectorLabels" $ | nindent 6 }}
+      prism.sparksnail.ai/member: {{ $member.name }}
   template:
     metadata:
       labels:
-        {{- include "prism-serve.worker.selectorLabels" . | nindent 8 }}
+        {{- include "prism-serve.worker.selectorLabels" $ | nindent 8 }}
+        prism.sparksnail.ai/member: {{ $member.name }}
+        prism.sparksnail.ai/topology-generation: {{ $.Values.worker.topologyGeneration | quote }}
     spec:
-      {{- with .Values.imagePullSecrets }}
+      {{- if $.Values.gateway.correctnessHarness.enabled }}
+      shareProcessNamespace: true
+      {{- end }}
+      {{- with $.Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       nodeSelector:
-        nvidia.com/gpu.product: {{ .Values.worker.gpu.type | quote }}
-        {{- with .Values.nodeSelector }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
-      {{- with .Values.tolerations }}
+        {{- toYaml (index $.Values.worker.nodeGroups $member.nodeGroup) | nindent 8 }}
+      {{- with $.Values.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      volumes:
+        - name: worker-topology
+          projected:
+            sources:
+              - configMap:
+                  name: {{ include "prism-serve.fullname" $ }}-worker-topology
+                  optional: true
+                  items:
+                    - key: startup-permit.json
+                      path: startup-permit.json
+        - name: worker-incarnation
+          emptyDir: {}
       containers:
         - name: worker
-          image: {{ include "prism-serve.worker.image" . }}
-          imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
+          image: {{ include "prism-serve.worker.image" $ }}
+          imagePullPolicy: {{ $.Values.worker.image.pullPolicy }}
+          command: ["prism-infer-worker"]
           ports:
             - name: rpc
-              containerPort: {{ .Values.worker.port }}
+              containerPort: {{ $.Values.worker.port }}
+            - name: rendezvous
+              containerPort: {{ $.Values.worker.rendezvousPort }}
           env:
             - name: PRISM_MODEL
-              value: {{ .Values.model | quote }}
+              value: {{ $.Values.model.localPath | quote }}
+            - name: PRISM_MODEL_PROFILE
+              value: {{ $.Values.model.profileId | quote }}
+            - name: PRISM_MODEL_ID
+              value: {{ $.Values.model.id | quote }}
+            - name: PRISM_MODEL_REVISION
+              value: {{ $.Values.model.revision | quote }}
+            - name: PRISM_TOKENIZER_REVISION
+              value: {{ $.Values.model.tokenizerRevision | quote }}
+            - name: PRISM_MODEL_CONFIG_SHA256
+              value: {{ $.Values.model.configSha256 | quote }}
+            - name: PRISM_DTYPE
+              value: {{ $.Values.model.dtype | quote }}
             - name: PRISM_TP_SIZE
-              value: {{ .Values.parallel.tp_size | quote }}
+              value: {{ $.Values.parallel.tp_size | quote }}
+            - name: PRISM_TOKENS_PER_BLOCK
+              value: {{ $.Values.model.tokensPerBlock | quote }}
+            - name: PRISM_KV_BLOCK_BYTES
+              value: {{ $.Values.model.kvBlockBytes | int64 | quote }}
+            - name: PRISM_KV_LAYOUT
+              value: {{ $.Values.model.kvLayout | quote }}
+            - name: PRISM_INSTANCE_ID
+              value: {{ $member.name | quote }}
+            - name: PRISM_ENGINE_ROLE
+              value: {{ $member.role | quote }}
+            - name: PRISM_GLOBAL_RANK
+              value: {{ $member.globalRank | quote }}
+            - name: PRISM_TOPOLOGY_GENERATION
+              value: {{ $.Values.worker.topologyGeneration | quote }}
+            - name: PRISM_TOPOLOGY_DIGEST
+              value: {{ printf "sha256:%s" (sha256sum (printf "%s:%s" $.Values.worker.topologyGeneration (toJson $.Values.worker.members))) | quote }}
+            - name: PRISM_KV_COMPATIBILITY_ID
+              value: {{ $.Values.model.kvCompatibilityId | quote }}
+            - name: PRISM_RPC_PORT
+              value: {{ $.Values.worker.port | quote }}
+            - name: PRISM_MASTER_ADDR
+              value: {{ printf "%s-p0" (include "prism-serve.fullname" $) | quote }}
+            - name: PRISM_MASTER_PORT
+              value: {{ $.Values.worker.rendezvousPort | quote }}
+            - name: PRISM_NATS_URL
+              value: {{ $.Values.nats.url | quote }}
+            - name: PRISM_REQUIRE_GDR
+              value: {{ ternary "1" "0" $.Values.worker.requireGpudirectRdma | quote }}
+            - name: PRISM_NCCL_WATCHDOG_TIMEOUT_S
+              value: {{ $.Values.worker.ncclWatchdogTimeoutSeconds | quote }}
+            - name: PRISM_TERMINATION_LOG_PATH
+              value: /dev/termination-log
+            - name: PYTHONFAULTHANDLER
+              value: "1"
+            - name: NCCL_DEBUG
+              value: INFO
+            - name: NCCL_SOCKET_IFNAME
+              value: {{ $.Values.worker.nccl.socketIfname | quote }}
+            - name: NCCL_IB_DISABLE
+              value: {{ ternary "1" "0" $.Values.worker.nccl.ibDisable | quote }}
+            - name: NCCL_P2P_DISABLE
+              value: {{ ternary "1" "0" $.Values.worker.nccl.p2pDisable | quote }}
+            - name: NCCL_SHM_DISABLE
+              value: {{ ternary "1" "0" $.Values.worker.nccl.shmDisable | quote }}
+            - name: NCCL_DEBUG_SUBSYS
+              value: {{ $.Values.worker.nccl.debugSubsystems | quote }}
+            - name: NCCL_DEBUG_FILE
+              value: /tmp/prism-nccl-debug.log
+            - name: PRISM_NCCL_DEBUG_LOG
+              value: /tmp/prism-nccl-debug.log
+            - name: PRISM_WORKER_ENDPOINTS_JSON
+              value: {{ dict "p0" (printf "http://%s-p0:%v" (include "prism-serve.fullname" $) $.Values.worker.port) "p1" (printf "http://%s-p1:%v" (include "prism-serve.fullname" $) $.Values.worker.port) "d0" (printf "http://%s-d0:%v" (include "prism-serve.fullname" $) $.Values.worker.port) "d1" (printf "http://%s-d1:%v" (include "prism-serve.fullname" $) $.Values.worker.port) | toJson | quote }}
+            - name: PRISM_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: PRISM_STARTUP_PERMIT_PATH
+              value: /etc/prism/topology/startup-permit.json
+            - name: PRISM_INCARNATION_RECORD_PATH
+              value: /var/run/prism/incarnation/record.json
+            {{- if $.Values.gateway.correctnessHarness.enabled }}
+            - name: PRISM_PROCESS_IDENTITY_PATH
+              value: /tmp/prism-worker-process-identity.json
+            {{- end }}
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+          volumeMounts:
+            - name: worker-topology
+              mountPath: /etc/prism/topology
+              readOnly: true
+            - name: worker-incarnation
+              mountPath: /var/run/prism/incarnation
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
           resources:
             requests:
-              cpu: {{ .Values.worker.resources.requests.cpu | quote }}
-              memory: {{ .Values.worker.resources.requests.memory | quote }}
-              nvidia.com/gpu: {{ .Values.worker.gpu.count }}
+              cpu: {{ $.Values.worker.resources.requests.cpu | quote }}
+              memory: {{ $.Values.worker.resources.requests.memory | quote }}
+              nvidia.com/gpu: 1
             limits:
-              cpu: {{ .Values.worker.resources.limits.cpu | quote }}
-              memory: {{ .Values.worker.resources.limits.memory | quote }}
-              nvidia.com/gpu: {{ .Values.worker.gpu.count }}
-          volumeMounts:
-            - name: kv-scratch
-              mountPath: /var/lib/prism/kv
-  volumeClaimTemplates:
-    - metadata:
-        name: kv-scratch
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        {{- with .Values.worker.storage.storageClassName }}
-        storageClassName: {{ . | quote }}
-        {{- end }}
-        resources:
-          requests:
-            storage: {{ .Values.worker.storage.size }}
+              cpu: {{ $.Values.worker.resources.limits.cpu | quote }}
+              memory: {{ $.Values.worker.resources.limits.memory | quote }}
+              nvidia.com/gpu: 1
+          readinessProbe:
+            httpGet: {path: /v1/capabilities, port: rpc}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 24
+{{- end }}

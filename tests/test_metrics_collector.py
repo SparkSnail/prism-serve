@@ -94,6 +94,7 @@ def _make_collector_with_mock_prometheus():
     mc._prefill_abort = _mock_counter()
     mc._decode_abort = _mock_counter()
     mc._control_message_error = _mock_counter()
+    mc._nccl_transfer_bytes = _mock_counter()
 
     mc._active_reqs    = _mock_gauge()
     mc._waiting_reqs   = _mock_gauge()
@@ -117,6 +118,17 @@ def test_increment_known_counter_with_labels():
     mc.increment("kv_transfer_recompute_total", labels={"reason": "timeout", "attempt": "1"})
     mc._kv_recompute.labels.assert_called_once_with(reason="timeout", attempt="1")
     mc._kv_recompute.labels.return_value.inc.assert_called_once()
+
+
+def test_nccl_transfer_bytes_is_a_counter_not_histogram():
+    mc = _make_collector_with_mock_prometheus()
+    labels = {"pair": "p0--d1", "path": "normal"}
+
+    mc.increment("nccl_transfer_bytes", 4096, labels=labels)
+
+    mc._nccl_transfer_bytes.labels.assert_called_once_with(**labels)
+    mc._nccl_transfer_bytes.labels.return_value.inc.assert_called_once_with(4096)
+    assert "nccl_transfer_bytes" not in mc._histogram_map()
 
 
 def test_increment_unknown_name_is_noop():

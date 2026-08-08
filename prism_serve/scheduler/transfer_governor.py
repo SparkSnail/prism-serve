@@ -14,21 +14,30 @@ class TransferDispatchError(RuntimeError):
 
 
 class TransferGovernor:
-    """Apply per-destination watermarks, byte caps, and retry limits."""
+    """Control KV transfers with watermarks and per-pair byte caps."""
 
-    # Class-level defaults (can be overridden via config)
-    HIGH_WATERMARK:     float = 0.85   # pause sending above this KV usage
-    LOW_WATERMARK:      float = 0.70   # resume sending below this KV usage
-    MAX_BYTES_INFLIGHT: int   = 256 * 1024 * 1024  # 256 MB byte cap
 
-    def __init__(self, config: dict, infer_client, metrics) -> None:
+    HIGH_WATERMARK:     float = 0.85
+    LOW_WATERMARK:      float = 0.70
+    MAX_BYTES_INFLIGHT_PER_PAIR: int = 1024 * 1024 * 1024
+    MAX_BYTES_INFLIGHT: int = MAX_BYTES_INFLIGHT_PER_PAIR
+
+    def __init__(
+        self, config: dict, infer_client, metrics, worker_registry=None
+    ) -> None:
         self.config = config
         self.infer_client = infer_client
         self.metrics = metrics
+        self.worker_registry = worker_registry
 
         self.HIGH_WATERMARK     = config.get("HIGH_WATERMARK",     self.HIGH_WATERMARK)
         self.LOW_WATERMARK      = config.get("LOW_WATERMARK",      self.LOW_WATERMARK)
-        self.MAX_BYTES_INFLIGHT = config.get("MAX_BYTES_INFLIGHT", self.MAX_BYTES_INFLIGHT)
+        self.MAX_BYTES_INFLIGHT_PER_PAIR = config.get(
+            "max_bytes_inflight_per_pair",
+            config.get("MAX_BYTES_INFLIGHT", self.MAX_BYTES_INFLIGHT_PER_PAIR),
+        )
+        # Compatibility alias for callers that inspect the old attribute.
+        self.MAX_BYTES_INFLIGHT = self.MAX_BYTES_INFLIGHT_PER_PAIR
 
         # Usage samples are valid only for the destination's current epoch.
         self._kv_usage:       dict[str, KVUsageSample]       = {}
@@ -36,8 +45,11 @@ class TransferGovernor:
         self._kv_usage_stale_after_s: float = config.get(
             "kv_usage_stale_after_s", 10.0
         )
+
+
+        self._pair_bytes_inflight: dict[str, int]            = defaultdict(int)
         self._bytes_inflight: dict[str, int]                 = defaultdict(int)
-        # Per-destination FIFO preserves transfer order.
+
         self._deferred:       dict[str, deque[TransferTask]] = defaultdict(deque)
         # Identity tracking invalidates callbacks from cancelled or superseded tasks.
         self._inflight_tasks: dict[str, TransferTask] = {}
@@ -68,7 +80,7 @@ class TransferGovernor:
             and normalized.ratio < self.LOW_WATERMARK
             and self._sample_is_fresh(instance_id)
         ):
-            self._flush_deferred(instance_id)
+            self._flush_deferred_for_dst(instance_id)
 
     def set_expected_epochs(self, epochs: dict[str, str]) -> None:
         self._expected_epochs = dict(epochs)
@@ -85,8 +97,28 @@ class TransferGovernor:
             <= self._kv_usage_stale_after_s
         )
 
-    def can_send(self, dst: str, size_bytes: int, priority: int = 1) -> bool:
-        """Return whether fresh usage and byte caps permit this transfer."""
+    @staticmethod
+    def _pair_id(src: str, dst: str) -> str:
+        return f"{src}--{dst}"
+
+    def _flush_deferred_for_dst(self, dst: str) -> None:
+        self._flush_deferred(dst)
+
+    def can_send(
+        self,
+        dst: str,
+        size_bytes: int,
+        priority: int = 1,
+        *,
+        src: str | None = None,
+    ) -> bool:
+        if self.worker_registry is not None:
+            if not self.worker_registry.can_govern(dst):
+                return False
+            if src is not None and not self.worker_registry.can_govern(src):
+                return False
+
+
         if not self._sample_is_fresh(dst):
             return False
         if self._kv_usage[dst].ratio >= self.HIGH_WATERMARK:
@@ -95,47 +127,65 @@ class TransferGovernor:
             )
             return False
 
-        # The cap limits concurrency, not request size. An oversized transfer
-        # may own an idle destination so it cannot block the FIFO forever.
-        cap = self.MAX_BYTES_INFLIGHT * (1.0 if priority >= 1 else 0.3)
+
+        cap = self.MAX_BYTES_INFLIGHT_PER_PAIR * (1.0 if priority >= 1 else 0.3)
+        pair_id = self._pair_id(src, dst) if src is not None else None
+        current = (
+            self._pair_bytes_inflight[pair_id]
+            if pair_id is not None
+            else self._bytes_inflight[dst]
+        )
+
+
         if size_bytes > cap:
-            return self._bytes_inflight[dst] == 0
-        if self._bytes_inflight[dst] + size_bytes > cap:
+            return current == 0
+        if current + size_bytes > cap:
             return False
 
         return True
 
     def submit(self, task: TransferTask) -> None:
         dst = task.dst
-        if self.can_send(dst, task.kv_size, task.priority):
+        pair_id = self._pair_id(task.src, task.dst)
+        if self.can_send(dst, task.kv_size, task.priority, src=task.src):
             self._dispatch(task)
         else:
             self._deferred[dst].append(task)
             self.metrics.gauge(
                 "deferred_queue_depth",
                 len(self._deferred[dst]),
-                labels={"dst": dst},
+                labels={"dst": dst, "pair": pair_id},
             )
 
     def _dispatch(self, task: TransferTask) -> None:
+        pair_id = self._pair_id(task.src, task.dst)
+        self._pair_bytes_inflight[pair_id] += task.kv_size
         self._bytes_inflight[task.dst] += task.kv_size
         self._inflight_tasks[task.req_id] = task
         try:
-            self.infer_client.transfer(
-                src=task.src,
-                dst=task.dst,
-                req_id=task.req_id,
-                operation_id=task.operation_id,
-                on_complete=lambda: self._on_complete(task),
-            )
+            if getattr(self.infer_client, "week12_network_control", False) is True:
+                self.infer_client.transfer_task(
+                    task, lambda: self._on_complete(task)
+                )
+            else:
+                self.infer_client.transfer(
+                    src=task.src,
+                    dst=task.dst,
+                    req_id=task.req_id,
+                    operation_id=task.operation_id,
+                    on_complete=lambda: self._on_complete(task),
+                )
         except Exception as exc:
             if self._inflight_tasks.get(task.req_id) is task:
                 del self._inflight_tasks[task.req_id]
+                self._pair_bytes_inflight[pair_id] = max(
+                    0, self._pair_bytes_inflight[pair_id] - task.kv_size
+                )
                 self._bytes_inflight[task.dst] = max(
                     0, self._bytes_inflight[task.dst] - task.kv_size
                 )
             raise TransferDispatchError(
-                f"transfer dispatch failed for req={task.req_id!r}"
+                f"transfer dispatch failed for req={task.req_id!r}: {exc}"
             ) from exc
 
     def _on_complete(self, task: TransferTask) -> None:
@@ -143,6 +193,10 @@ class TransferGovernor:
         if self._inflight_tasks.get(task.req_id) is not task:
             return
         del self._inflight_tasks[task.req_id]
+        pair_id = self._pair_id(task.src, task.dst)
+        self._pair_bytes_inflight[pair_id] = max(
+            0, self._pair_bytes_inflight[pair_id] - task.kv_size
+        )
         self._bytes_inflight[task.dst] = max(
             0, self._bytes_inflight[task.dst] - task.kv_size
         )
@@ -176,7 +230,7 @@ class TransferGovernor:
                 self._deferred[dst] = kept
                 cancelled = True
                 self.metrics.gauge(
-                    "deferred_queue_depth", len(kept), labels={"dst": dst}
+                    "deferred_queue_depth", len(kept), labels={"dst": dst},
                 )
 
         task = self._inflight_tasks.get(req_id)
@@ -184,6 +238,10 @@ class TransferGovernor:
             operation_id is None or task.operation_id == operation_id
         ):
             del self._inflight_tasks[req_id]
+            pair_id = self._pair_id(task.src, task.dst)
+            self._pair_bytes_inflight[pair_id] = max(
+                0, self._pair_bytes_inflight[pair_id] - task.kv_size
+            )
             self._bytes_inflight[task.dst] = max(
                 0, self._bytes_inflight[task.dst] - task.kv_size
             )
@@ -206,6 +264,23 @@ class TransferGovernor:
             return "deferred"
         return "none"
 
+    def quarantined_transfer_totals(
+        self, operation_ids: set[str]
+    ) -> tuple[int, dict[str, int]]:
+        tasks = [
+            *self._inflight_tasks.values(),
+            *(task for queue in self._deferred.values() for task in queue),
+        ]
+        matching = {
+            task.operation_id: task for task in tasks
+            if task.operation_id in operation_ids
+        }
+        bytes_by_pair: dict[str, int] = {}
+        for task in matching.values():
+            pair = f"{task.src}--{task.dst}"
+            bytes_by_pair[pair] = bytes_by_pair.get(pair, 0) + task.kv_size
+        return len(matching), bytes_by_pair
+
     def tick(self) -> None:
         """Attempt to flush every deferred destination queue."""
         for dst in list(self._deferred.keys()):
@@ -217,8 +292,10 @@ class TransferGovernor:
         q = self._deferred[dst]
         while q:
             task = q[0]
-            if not self.can_send(dst, task.kv_size, task.priority):
-                break  # still congested, stop
+            if not self.can_send(
+                task.dst, task.kv_size, task.priority, src=task.src
+            ):
+                break
             q.popleft()
             self._dispatch(task)
 
@@ -244,9 +321,8 @@ class TransferGovernor:
         )
         return "recompute"
 
-    def trigger_recompute(self, req_id: str, dst: str) -> None:
-        """Tell the assigned D instance to recompute prefill locally."""
-        self.infer_client.reset_to_waiting(dst, req_id)
+    def trigger_recompute(self, req_id: str, dst: str):
+        return self.infer_client.reset_to_waiting(dst, req_id)
 
     def finish_request(self, req_id: str) -> None:
         """Release transfer and retry bookkeeping for a terminal request."""
@@ -255,6 +331,15 @@ class TransferGovernor:
 
     def bytes_inflight(self, dst: str) -> int:
         return self._bytes_inflight.get(dst, 0)
+
+    def bytes_inflight_for_pair(self, src: str, dst: str) -> int:
+        return self._pair_bytes_inflight.get(self._pair_id(src, dst), 0)
+
+    def pair_bytes_inflight_snapshot(self) -> dict[str, int]:
+        return {
+            pair: value for pair, value in self._pair_bytes_inflight.items()
+            if value > 0
+        }
 
     def deferred_depth(self, dst: str) -> int:
         return len(self._deferred.get(dst, []))

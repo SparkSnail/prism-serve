@@ -5,10 +5,10 @@
 <h3 align="center">A Kubernetes control plane for disaggregated LLM serving</h3>
 
 <p align="center">
-  <a href="#features"><b>Features</b></a> ·
-  <a href="#installation"><b>Installation</b></a> ·
-  <a href="#quick-start"><b>Quick Start</b></a> ·
-  <a href="#testing"><b>Testing</b></a> ·
+  <a href="#features"><b>Features</b></a> &middot;
+  <a href="#installation"><b>Installation</b></a> &middot;
+  <a href="#quick-start"><b>Quick Start</b></a> &middot;
+  <a href="#testing"><b>Testing</b></a> &middot;
   <a href="#deployment"><b>Deployment</b></a>
 </p>
 
@@ -18,10 +18,16 @@
   </a>
 </p>
 
-**prism-serve** is a control plane that turns single-instance LLM inference engines into a
-fault-tolerant, elastic cluster service on Kubernetes: cluster-level prefill/decode (PD)
-scheduling, KV transfer flow control, recompute fallback, and a 10 ms reconcile loop modelled
-on Ray Serve.
+**prism-serve** coordinates disaggregated LLM inference workers on Kubernetes. The current
+code covers cluster-level prefill/decode (PD) scheduling, KV transfer flow control,
+recompute fallback, and a 10 ms reconcile loop modelled on Ray Serve.
+
+> [!WARNING]
+> This is an experimental fixed 2P2D snapshot, not a production-ready release, and it
+> does not claim complete E2E success. The latest frozen two-node/four-GPU campaign ran
+> 31/35 cases passed (31 passed, 3 failed, and 1 was blocked); 4/5 evidence packets passed;
+> final-clean failed. Known limitations are a decode-worker SIGSEGV during gateway
+> restart cleanup and tunnel recovery failure while the local forwarding port remained bound.
 
 ## Features
 
@@ -30,8 +36,8 @@ on Ray Serve.
 - [x] **KV transfer flow control**: dynamic high/low watermark, per-dst byte cap, FIFO deferred queue with automatic flush
 - [x] **Recompute fallback**: timeout detection, `reset_to_waiting` on D instance, abort after max attempts
 - [x] **Request state machine**: per-request `SeqState` lifecycle, illegal-transition guard, stuck-request detection, TTFT timestamps
-- [x] **10 ms schedule loop**: Phase 1-6 reconcile — assign P/D, submit KV, stuck check, deferred flush, collect finished, metrics
-- [x] **NATS queue**: publish/subscribe wrapper, inbox buffer, `queue_group` exactly-once delivery, wildcard `kv_usage.*` subscription
+- [x] **10 ms schedule loop**: Phase 1-6 reconcile - assign P/D, submit KV, stuck check, deferred flush, collect finished, metrics
+- [x] **NATS queue**: publish/subscribe wrapper, bounded inbox, queue-group load balancing, wildcard `kv_usage.*` subscription
 - [x] **Metrics**: Prometheus counters/gauges/histograms for TTFT, KV transfer, congestion, deferred depth, slot utilisation
 
 ## Installation
@@ -62,7 +68,7 @@ PRISM_SERVE_NATS_REQUIRED=false prism-serve
 Check it is alive:
 
 ```bash
-curl localhost:8080/healthz   # {"status":"ok","version":"0.1.0"}
+curl localhost:8080/healthz   # {"status":"ok","version":"..."}
 curl localhost:8080/readyz    # {"status":"ready"}
 ```
 

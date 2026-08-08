@@ -8,6 +8,8 @@ import pytest
 from prism_serve.metrics.collector import NullMetrics
 from prism_serve.router.coordinator import AffinityCoordinator
 from prism_serve.router.fingerprint import PromptFingerprint
+from prism_serve.router.http_rpc import EndpointSequenceAllocator
+from prism_serve.router.http_rpc import AmbiguousRPCError
 from prism_serve.router.protocol import (
     CachedPrefixDecision,
     MappedTransferStatus,
@@ -102,6 +104,29 @@ async def test_coordinator_commits_slot_and_dispatches_only_suffix():
     assert tracker.get("r").state == SeqState.PREFIX_PREFILLING
     assert scheduler.decode_slot_lease(tracker.get("r").active_operation_id).state == "ACTIVE"
     assert queue.messages[0][1]["remaining_token_ids"] == [8, 9]
+
+
+@pytest.mark.asyncio
+async def test_suffix_dispatch_uses_versioned_endpoint_envelope():
+    queue = Queue()
+    decision = CachedPrefixDecision("src", "se", "dst", 2, 8, 64, 1.0)
+    allocator = EndpointSequenceAllocator("world-a", "gateway-a")
+    coordinator = AffinityCoordinator(
+        StaticRouter([decision]), RPC(), queue,
+        {"prefill_ms_per_token": 0.1, "locality_wait_ms": 20},
+        operation_allocator=allocator,
+    )
+    scheduler = _scheduler()
+    tracker = RequestTracker(NullMetrics())
+    tracker.add(_request())
+    assert await coordinator.try_start(tracker.get("r"), scheduler, tracker)
+    await asyncio.gather(*coordinator._tasks.values())
+
+    command = queue.messages[0][1]
+    assert command["schema_version"] == 1
+    assert command["endpoint_ref"]["target_instance"] == "dst"
+    assert command["payload"]["remaining_token_ids"] == [8, 9]
+    assert tracker.get("r").suffix_operation_ref.operation_seq == 1
 
 
 @pytest.mark.asyncio
@@ -296,3 +321,92 @@ async def test_suffix_publish_failure_keeps_active_lease_for_watchdog_abort():
     await asyncio.gather(*coordinator._tasks.values())
     assert tracker.get("r").state == SeqState.PREFIX_PREFILLING
     assert scheduler.decode_slot_lease(operation_id).state == "ACTIVE"
+
+
+class CommittedSourceReleaseRPC(RPC):
+    def __init__(self, first_error):
+        super().__init__()
+        self.first_error = first_error
+        self.unpin_attempts = 0
+        self.source_released = asyncio.Event()
+
+    async def unpin_prefix(self, source, operation_id):
+        self.unpin_attempts += 1
+        if self.unpin_attempts == 1:
+            raise self.first_error
+        await super().unpin_prefix(source, operation_id)
+        self.source_released.set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first_error",
+    [
+        ConnectionError("pre-send connection failure"),
+        AmbiguousRPCError(None, "post-send response lost"),
+    ],
+    ids=["ordinary-pre-send", "ambiguous-post-send"],
+)
+async def test_committed_target_dispatches_suffix_while_source_release_retries(
+    first_error,
+):
+    rpc = CommittedSourceReleaseRPC(first_error)
+    queue = Queue()
+    decision = CachedPrefixDecision("src", "se", "dst", 2, 8, 64, 1.0)
+    coordinator = AffinityCoordinator(
+        StaticRouter([decision]),
+        rpc,
+        queue,
+        {"prefix_reconcile_interval_s": 0.001},
+    )
+    scheduler = _scheduler()
+    tracker = RequestTracker(NullMetrics())
+    tracker.add(_request())
+
+    assert await coordinator.try_start(tracker.get("r"), scheduler, tracker)
+    operation_id = tracker.get("r").active_operation_id
+    await asyncio.gather(*coordinator._tasks.values())
+    await asyncio.wait_for(rpc.source_released.wait(), 0.2)
+
+    request = tracker.get("r")
+    assert request.state == SeqState.PREFIX_PREFILLING
+    assert scheduler.decode_slot_lease(operation_id).state == "ACTIVE"
+    assert len(queue.messages) == 1
+    assert queue.messages[0][1]["operation_id"] == operation_id
+    assert rpc.unpin_attempts == 2
+    assert rpc.unpinned == [("src", operation_id)]
+    assert coordinator._contexts[operation_id].source_pinned is False
+    await coordinator.shutdown()
+
+
+class Week12RPC(RPC):
+    week12_network_control = True
+
+
+@pytest.mark.asyncio
+async def test_week12_keeps_cross_source_pin_until_request_cleanup_proof():
+    rpc = Week12RPC()
+    queue = Queue()
+    decision = CachedPrefixDecision("src", "se", "dst", 2, 8, 64, 1.0)
+    coordinator = AffinityCoordinator(
+        StaticRouter([decision]), rpc, queue,
+        {"prefill_ms_per_token": 0.1, "locality_wait_ms": 20},
+    )
+    scheduler = _scheduler()
+    tracker = RequestTracker(NullMetrics())
+    tracker.add(_request())
+
+    assert await coordinator.try_start(tracker.get("r"), scheduler, tracker)
+    operation_id = tracker.get("r").active_operation_id
+    await asyncio.gather(*coordinator._tasks.values())
+
+    request = tracker.get("r")
+    assert request.state == SeqState.PREFIX_PREFILLING
+    assert rpc.unpinned == []
+    assert coordinator._contexts[operation_id].source_pinned is True
+
+    # In production this hook runs only after NetworkControlRPC's generic
+    # request cleanup returns its stored release proof.
+    coordinator.terminal_cleanup_complete(request)
+    assert operation_id not in coordinator._contexts
+    assert rpc.unpinned == []

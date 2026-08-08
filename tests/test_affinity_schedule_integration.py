@@ -38,8 +38,15 @@ class SuffixAbortCoordinator:
     def __init__(self, stopped):
         self.stopped = stopped
 
-    async def abort_suffix(self, req):
-        return self.stopped
+    async def cleanup_suffix(self, req, scheduler, tracker):
+        from prism_serve.router.protocol import CleanupOutcome, PrefixOperationStatus
+
+        scheduler.quarantine_decode_slot(req.active_operation_id)
+        if not self.stopped:
+            return None
+        assert tracker.get(req.req_id) is req
+        scheduler.release_quarantined_decode_slot(req.active_operation_id)
+        return CleanupOutcome("ABORTED", PrefixOperationStatus.ABORTED)
 
 
 class Coordinator:
@@ -111,12 +118,12 @@ async def test_suffix_completion_requires_operation_and_epoch_match() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stopped, expected_free, expected_state", [
-    (True, 1, "RELEASED"),
-    (False, 0, "QUARANTINED"),
+@pytest.mark.parametrize("stopped, expected_free, expected_state, retained", [
+    (True, 1, "RELEASED", False),
+    (False, 0, "QUARANTINED", True),
 ])
 async def test_suffix_timeout_releases_only_after_abort_ack(
-    stopped, expected_free, expected_state
+    stopped, expected_free, expected_state, retained
 ) -> None:
     metrics = NullMetrics()
     tracker = RequestTracker(metrics)
@@ -144,3 +151,4 @@ async def test_suffix_timeout_releases_only_after_abort_ack(
         await task
     assert scheduler.decode_free_slots()["d0"] == expected_free
     assert scheduler.decode_slot_lease("op").state == expected_state
+    assert (tracker.get("r1") is request) is retained

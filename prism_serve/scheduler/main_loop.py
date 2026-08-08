@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING
 
+from prism_serve.scheduler.resource_release import ResourceReleaseEvaluator
+
 if TYPE_CHECKING:
     from prism_serve.scheduler.scheduler import PDScheduler
     from prism_serve.scheduler.transfer_governor import TransferGovernor
@@ -21,6 +23,99 @@ logger = logging.getLogger(__name__)
 
 TICK_INTERVAL_S: float = 0.010
 
+NATS_COMMAND_FAULTS = {
+    "nats_drop": 0,
+    "nats_duplicate": 2,
+    "nats_publish_unknown": 1,
+}
+
+
+class InjectedNATSCommandFault(RuntimeError):
+    """Deterministic one-shot command publish fault for the correctness gate."""
+
+
+async def _publish_command_with_fault(
+    queue,
+    subject: str,
+    command: dict[str, object],
+    directive: dict[str, object] | None,
+    record_event,
+    observe_worker_authority,
+) -> None:
+    fault_kind = str((directive or {}).get("fault_kind") or "")
+    if fault_kind not in NATS_COMMAND_FAULTS:
+        await queue.publish(subject, command)
+        return
+
+    endpoint_ref = command.get("endpoint_ref")
+    if not isinstance(endpoint_ref, dict):
+        raise RuntimeError("NATS command fault requires an exact endpoint ref")
+    publish_count = 0
+    for _ in range(NATS_COMMAND_FAULTS[fault_kind]):
+        await queue.publish(subject, command)
+        publish_count += 1
+    observation = {"delivery_count": 0, "execution_count": 0}
+    if fault_kind != "nats_drop":
+        observation = await observe_worker_authority(endpoint_ref, fault_kind)
+    delivery_count = observation.get("delivery_count")
+    execution_count = observation.get("execution_count")
+    expected = {
+        "nats_drop": (0, 0),
+        "nats_duplicate": (2, 1),
+        "nats_publish_unknown": (1, 1),
+    }[fault_kind]
+    if (delivery_count, execution_count) != expected:
+        raise RuntimeError(
+            f"{fault_kind} worker authority mismatch: "
+            f"delivery={delivery_count!r} execution={execution_count!r}"
+        )
+    record_event(
+        "fault_injected",
+        {
+            "fault_kind": fault_kind,
+            "operation_id": str(endpoint_ref.get("operation_id") or ""),
+            "endpoint_ref": dict(endpoint_ref),
+            "subject": subject,
+            "publish_count": publish_count,
+            "delivery_count": delivery_count,
+            "execution_count": execution_count,
+        },
+    )
+    raise InjectedNATSCommandFault(
+        f"injected {fault_kind} after {publish_count} publish call(s)"
+    )
+
+
+def _normal_prefill_payload(req, queue) -> dict[str, object]:
+    """Build the immutable NATS payload covered by the endpoint ref digest."""
+    return {
+        "instance_id": req.prefill_instance,
+        "instance_epoch": req.prefill_instance_epoch,
+        "decode_instance_epoch": req.decode_instance_epoch,
+        "req_id": req.req_id,
+        "owner_id": queue.owner_id,
+        "command_id": req.command_id,
+        # Retries resend this exact envelope/ref; attempt count is local-only.
+        "dispatch_attempt": 1,
+        "prefill_done_subject": queue.reply_subject("prefill_done"),
+        "recompute_done_subject": queue.reply_subject("recompute_done"),
+        "first_token_subject": queue.reply_subject("first_token"),
+        "decode_done_subject": queue.reply_subject("decode_done"),
+        "decode_progress_subject": queue.reply_subject("decode_progress"),
+        "reply_subject": queue.reply_subject("prefill_done"),
+        "token_ids": list(req.token_ids),
+        "sampling_params": dict(req.sampling_params),
+        "held_resource_kinds": ["SOURCE_BLOCKS"],
+    }
+
+
+def _uses_week12_network_control(governor) -> bool:
+    return getattr(
+        getattr(governor, "infer_client", None),
+        "week12_network_control",
+        False,
+    ) is True
+
 
 async def schedule_loop(
     scheduler: "PDScheduler",
@@ -30,6 +125,8 @@ async def schedule_loop(
     metrics,
     config: dict,
     affinity_coordinator=None,
+    output_buffer=None,
+    operation_allocator=None,
 ) -> None:
     """Run scheduling ticks until cancelled."""
     from prism_serve.scheduler.sequence_state import SeqState, TransferTask
@@ -43,32 +140,99 @@ async def schedule_loop(
     max_dispatch_attempts: int = config.get("max_dispatch_attempts", 3)
     abort_timeout_s: float = config.get("abort_request_timeout_s", 5.0)
     tick_interval_s = config.get("schedule_loop_tick_ms", 10) / 1000.0
+    output_query_interval_s = config.get(
+        "operation_query_interval_ms", 50
+    ) / 1000.0
 
     while True:
         tick_start = time.monotonic()
 
-        # Dispatch waiting requests to prefill and decode instances.
-        # Stop as soon as there are no available P instances (all remaining
-        # WAITING requests will be retried next tick).
-        for req in list(tracker.iter_by_state(SeqState.WAITING)):
+        # ── Phase 1: WAITING → PREFILLING ─────────────────────────────
+
+
+        waiting = (
+            list(tracker.iter_by_state(SeqState.WAITING))
+            if scheduler.admission_ready()
+            else ()
+        )
+        for req in waiting:
             if (
                 config.get("affinity_enabled", False)
                 and affinity_coordinator is not None
                 and req.fingerprint is not None
+                and req.correctness_path not in {"cold", "seed_d0", "seed_d1"}
                 and await affinity_coordinator.try_start(req, scheduler, tracker)
             ):
                 continue
-            p = scheduler.pick_prefill_instance(req.req_id)
+            p = scheduler.pick_prefill_instance(
+                req.req_id,
+                required_instance=(req.correctness_source_instance or None),
+            )
             if p is None:
-                # No P instance available; leave all WAITING for next tick.
                 break
-            d = scheduler.pick_decode_instance(req.req_id, req.kv_size_bytes)
+            d = scheduler.pick_decode_instance(
+                req.req_id,
+                req.kv_size_bytes,
+                required_instance=(req.correctness_target_instance or None),
+            )
             if d is None:
                 # Release P load before trying another request.
                 scheduler.on_prefill_done(p)
                 continue
             p_epoch = scheduler.instance_epoch(p)
             d_epoch = scheduler.instance_epoch(d)
+            target_request_ref = None
+            target_blocks: tuple[int, ...] = ()
+            network_control = _uses_week12_network_control(governor)
+            slot_lease = None
+            if network_control:
+                slot_lease = scheduler.adopt_picked_decode_slot(
+                    d, req.req_id, req.req_id
+                )
+                try:
+                    target_request_ref, target_blocks = await governor.infer_client.prepare_normal_request(
+                        d, d_epoch, req.req_id, req.token_ids, req.sampling_params,
+                        {
+                            "first_token_subject": queue.reply_subject("first_token"),
+                            "decode_progress_subject": queue.reply_subject("decode_progress"),
+                            "decode_done_subject": queue.reply_subject("decode_done"),
+                        },
+                        prefix_identity=(
+                            {
+                                "namespace": req.fingerprint.namespace,
+                                "kv_compatibility_id": req.fingerprint.kv_compatibility_id,
+                                "request_context_digest": req.fingerprint.request_context_digest,
+                            }
+                            if req.fingerprint is not None else None
+                        ),
+                    )
+                except Exception as exc:
+                    from prism_serve.router.http_rpc import AmbiguousRPCError
+                    scheduler.on_prefill_done(p, p_epoch)
+                    metrics.increment("infer_rpc_ambiguous_total", labels={
+                        "reason": "target_prepare_failed",
+                    })
+                    logger.warning("target prepare failed req=%s: %s", req.req_id, exc)
+                    if isinstance(exc, AmbiguousRPCError):
+                        target_request_ref = exc.endpoint_ref
+                        tracker.transition(
+                            req.req_id, SeqState.PREFILLING,
+                            prefill_instance=p, decode_instance=d,
+                            prefill_instance_epoch=p_epoch,
+                            decode_instance_epoch=d_epoch,
+                            command_id=f"{queue.owner_id}:{req.req_id}",
+                            publish_outcome="NOT_STARTED",
+                            active_operation_id=req.req_id,
+                            decode_slot_lease_id=slot_lease.lease_id,
+                            target_request_ref=target_request_ref,
+                        )
+                        await _join_canonical_cleanup(
+                            req, tracker, scheduler, governor, queue.owner_id,
+                            abort_timeout_s, abort_timeout_s,
+                        )
+                    else:
+                        scheduler.release_decode_slot(req.req_id)
+                    continue
             command_id = f"{queue.owner_id}:{req.req_id}"
             tracker.transition(
                 req.req_id, SeqState.PREFILLING,
@@ -78,22 +242,53 @@ async def schedule_loop(
                 decode_instance_epoch=d_epoch,
                 command_id=command_id,
                 publish_outcome="NOT_STARTED",
+                active_operation_id=req.req_id if network_control else "",
+                decode_slot_lease_id=(slot_lease.lease_id if slot_lease else ""),
+                target_request_ref=target_request_ref,
+                target_block_table=list(target_blocks),
             )
             publish_task = None
+            fault_directive = None
             try:
-                publish_task = asyncio.create_task(queue.publish(queue.dispatch_subject(p), {
-                    "instance_id": p,
-                    "instance_epoch": p_epoch,
-                    "decode_instance_epoch": d_epoch,
-                    "req_id": req.req_id,
-                    "owner_id": queue.owner_id,
-                    "command_id": command_id,
-                    "dispatch_attempt": 1,
-                    "prefill_done_subject": queue.reply_subject("prefill_done"),
-                    "recompute_done_subject": queue.reply_subject("recompute_done"),
-                    "first_token_subject": queue.reply_subject("first_token"),
-                    "decode_done_subject": queue.reply_subject("decode_done"),
-                }))
+                payload = _normal_prefill_payload(req, queue)
+                command = payload
+                if operation_allocator is not None:
+                    from dataclasses import asdict
+                    endpoint_ref = operation_allocator.allocate(
+                        target_instance=p,
+                        target_worker_epoch=p_epoch,
+                        operation_id=req.req_id,
+                        payload=payload,
+                    )
+                    req.dispatch_operation_ref = endpoint_ref
+                    command = {"schema_version": 1,
+                               "endpoint_ref": asdict(endpoint_ref),
+                               "payload": payload}
+                    if req.correctness_path:
+                        fault_directive = await governor.infer_client.correctness_fault_checkpoint(
+                            "before_nats_dispatch",
+                            {
+                                "request_id": req.req_id,
+                                "path": req.correctness_path,
+                                "source_instance": p,
+                                "target_instance": d,
+                                "source_endpoint_ref": asdict(endpoint_ref),
+                                "target_endpoint_ref": (
+                                    asdict(target_request_ref)
+                                    if target_request_ref is not None else None
+                                ),
+                            },
+                        )
+                publish_task = asyncio.create_task(
+                    _publish_command_with_fault(
+                        queue,
+                        queue.dispatch_subject(p),
+                        command,
+                        fault_directive,
+                        governor.infer_client.record_correctness_fault_event,
+                        governor.infer_client.wait_nats_command_fault_authority,
+                    )
+                )
                 await publish_task
                 tracker.set_publish_outcome(req.req_id, "ACKED")
             except asyncio.CancelledError:
@@ -136,20 +331,16 @@ async def schedule_loop(
 
         if affinity_coordinator is not None:
             for req in tracker.get_stuck_suffix_prefills(suffix_prefill_timeout_s):
-                stopped = await affinity_coordinator.abort_suffix(req)
-                if stopped:
-                    released = scheduler.on_decode_finished(
-                        req.decode_instance, req.decode_instance_epoch,
-                        req.active_operation_id,
-                    )
-                    if not released:
-                        scheduler.release_quarantined_decode_slot(
-                            req.active_operation_id
-                        )
-                else:
-                    scheduler.quarantine_decode_slot(req.active_operation_id)
-                tracker.transition(req.req_id, SeqState.ABORTED)
-                tracker.remove(req.req_id)
+                outcome = await affinity_coordinator.cleanup_suffix(
+                    req, scheduler, tracker
+                )
+                if outcome is None:
+                    # Exact-ref UNKNOWN is not an ACK.  The coordinator owns a
+                    # reconciliation task; tracker and quarantined slot remain.
+                    continue
+                if outcome.action == "ABORTED" and tracker.get(req.req_id) is req:
+                    tracker.transition(req.req_id, SeqState.ABORTED)
+                    tracker.remove(req.req_id)
 
         for req in tracker.get_stuck_prefills(prefill_timeout_s):
             if req.dispatch_attempts >= max_dispatch_attempts:
@@ -163,19 +354,18 @@ async def schedule_loop(
                 continue
             publish_task = None
             try:
-                publish_task = asyncio.create_task(queue.publish(queue.dispatch_subject(req.prefill_instance), {
-                    "instance_id": req.prefill_instance,
-                    "instance_epoch": req.prefill_instance_epoch,
-                    "decode_instance_epoch": req.decode_instance_epoch,
-                    "req_id": req.req_id,
-                    "owner_id": queue.owner_id,
-                    "command_id": f"{queue.owner_id}:{req.req_id}",
-                    "dispatch_attempt": req.dispatch_attempts + 1,
-                    "prefill_done_subject": queue.reply_subject("prefill_done"),
-                    "recompute_done_subject": queue.reply_subject("recompute_done"),
-                    "first_token_subject": queue.reply_subject("first_token"),
-                    "decode_done_subject": queue.reply_subject("decode_done"),
-                }))
+                payload = _normal_prefill_payload(req, queue)
+                command = payload
+                if req.dispatch_operation_ref is not None:
+                    from dataclasses import asdict
+                    command = {
+                        "schema_version": 1,
+                        "endpoint_ref": asdict(req.dispatch_operation_ref),
+                        "payload": payload,
+                    }
+                publish_task = asyncio.create_task(
+                    queue.publish(queue.dispatch_subject(req.prefill_instance), command)
+                )
                 await publish_task
                 tracker.set_publish_outcome(req.req_id, "ACKED")
             except asyncio.CancelledError:
@@ -221,28 +411,56 @@ async def schedule_loop(
 
             kv_size   = msg.get("kv_size_bytes", 0)
             blk_table = msg.get("block_table", [])
+            first_token = msg.get("first_token")
+            if _uses_week12_network_control(governor) and (
+                isinstance(first_token, bool) or not isinstance(first_token, int)
+            ):
+                metrics.increment(
+                    "control_message_error_total",
+                    labels={"operation": "prefill_done_first_token"},
+                )
+                await _join_canonical_cleanup(
+                    req, tracker, scheduler, governor, queue.owner_id,
+                    abort_timeout_s, abort_timeout_s,
+                )
+                continue
 
             tracker.transition(
                 req_id, SeqState.KV_PENDING,
                 kv_size_bytes=kv_size,
                 block_table=blk_table,
-                transfer_operation_id=uuid.uuid4().hex,
+                transfer_operation_id=(
+                    req.active_operation_id or uuid.uuid4().hex
+                ),
             )
             scheduler.on_prefill_done(
                 req.prefill_instance, req.prefill_instance_epoch
             )
 
             try:
-                governor.submit(TransferTask(
+                transfer_task = TransferTask(
                     req_id=req_id,
                     operation_id=req.transfer_operation_id,
                     src=req.prefill_instance,
                     dst=req.decode_instance,
                     kv_size=kv_size,
-                    on_complete=lambda rid=req_id, op=req.transfer_operation_id: _on_kv_done(
-                        rid, op, tracker, scheduler, metrics
-                    ),
-                ))
+                    src_epoch=req.prefill_instance_epoch,
+                    dst_epoch=req.decode_instance_epoch,
+                    src_block_ids=tuple(blk_table),
+                    dst_block_ids=tuple(req.target_block_table),
+                    target_request_ref=req.target_request_ref,
+                    token_ids=tuple(req.token_ids),
+                    sampling_params=dict(req.sampling_params),
+                    first_token=first_token,
+                    correctness_path=req.correctness_path,
+                )
+                transfer_task.on_complete = (
+                    lambda task=transfer_task: _on_kv_done(
+                        task.req_id, task.operation_id, tracker, scheduler,
+                        metrics, output_buffer, task.target_request_commit_ref,
+                    )
+                )
+                governor.submit(transfer_task)
             except TransferDispatchError as exc:
                 metrics.increment(
                     "kv_transfer_dispatch_error_total",
@@ -426,12 +644,86 @@ async def schedule_loop(
             req = tracker.get(req_id) if req_id is not None else None
             if (
                 req is not None
+                and (
+                    not _uses_week12_network_control(governor)
+                    or msg.get("operation_id") == req.active_operation_id
+                )
                 and msg.get("instance_epoch") == req.decode_instance_epoch
                 and scheduler.epoch_matches(
                     req.decode_instance, req.decode_instance_epoch
                 )
             ):
-                tracker.record_first_token(req_id)
+                if output_buffer is not None and msg.get("token_ids") is not None:
+                    try:
+                        await output_buffer.apply_cumulative(
+                            req_id, list(msg.get("token_ids", ())),
+                            int(msg.get("output_seq_no", -1)),
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                if req.state == SeqState.DECODING:
+                    tracker.record_first_token(req_id)
+
+        for msg in await queue.poll("decode_progress"):
+            req_id = msg.get("req_id")
+            req = tracker.get(req_id) if req_id is not None else None
+            if (
+                output_buffer is None
+                or req is None
+                or (
+                    _uses_week12_network_control(governor)
+                    and msg.get("operation_id") != req.active_operation_id
+                )
+                or msg.get("instance_epoch") != req.decode_instance_epoch
+                or not scheduler.epoch_matches(
+                    req.decode_instance, req.decode_instance_epoch
+                )
+            ):
+                continue
+            try:
+                await output_buffer.apply_cumulative(
+                    req_id,
+                    list(msg.get("token_ids", ())),
+                    int(msg.get("output_seq_no", -1)),
+                )
+            except (TypeError, ValueError):
+                metrics.increment("control_message_error_total", labels={
+                    "operation": "decode_progress",
+                })
+                if _uses_week12_network_control(governor):
+                    from prism_serve.gateway.output import (
+                        output_query_identity,
+                        repair_output_gap,
+                    )
+                    identity = output_query_identity(req)
+                    if identity is None:
+                        continue
+                    (
+                        instance_id, instance_epoch,
+                        query_req_id, operation_id,
+                    ) = identity
+                    try:
+                        cursor = len(output_buffer.snapshot(req_id)[0])
+                        await repair_output_gap(
+                            governor.infer_client,
+                            instance_id=instance_id,
+                            instance_epoch=instance_epoch,
+                            req_id=query_req_id,
+                            operation_id=operation_id,
+                            cursor=cursor,
+                            output_buffer=output_buffer,
+                            metrics=metrics,
+                            still_current=(
+                                lambda req=req, identity=identity: (
+                                    tracker.get(req.req_id) is req
+                                    and output_query_identity(req) == identity
+                                )
+                            ),
+                        )
+                    except Exception:
+                        metrics.increment("control_message_error_total", labels={
+                            "operation": "output_gap_query",
+                        })
 
         for msg in await queue.poll("decode_done"):
             req_id = msg.get("req_id")
@@ -440,20 +732,85 @@ async def schedule_loop(
             req = tracker.get(req_id)
             if (
                 req is None
-                or req.state != SeqState.DECODING
+                or req.state not in {SeqState.KV_PENDING, SeqState.DECODING}
+                or (
+                    _uses_week12_network_control(governor)
+                    and msg.get("operation_id") != req.active_operation_id
+                )
                 or msg.get("instance_epoch") != req.decode_instance_epoch
                 or not scheduler.epoch_matches(
                     req.decode_instance, req.decode_instance_epoch
                 )
             ):
                 continue
-            tracker.transition(req_id, SeqState.FINISHED)
-            scheduler.on_decode_finished(
-                req.decode_instance, req.decode_instance_epoch,
-                req.active_operation_id or None,
-            )
-            governor.finish_request(req_id)
-            tracker.remove(req_id)
+            if output_buffer is not None:
+                token_ids = list(msg.get("token_ids", ()))
+                try:
+                    await output_buffer.apply_cumulative(
+                        req_id, token_ids, int(msg.get("output_seq_no", len(token_ids))),
+                        terminal=True,
+                    )
+                except (TypeError, ValueError):
+                    await output_buffer.apply_cumulative(
+                        req_id, [], 0, terminal=True, error="invalid decode_done cursor"
+                    )
+            if req.state == SeqState.DECODING:
+                tracker.transition(req_id, SeqState.FINISHED)
+            if not _uses_week12_network_control(governor):
+                scheduler.on_decode_finished(
+                    req.decode_instance, req.decode_instance_epoch,
+                    req.active_operation_id or None,
+                )
+                governor.finish_request(req_id)
+                tracker.remove(req_id)
+                if output_buffer is not None:
+                    output_buffer.mark_resource_free(req_id)
+
+        if _uses_week12_network_control(governor):
+            if output_buffer is not None:
+                now = time.monotonic()
+                for req in list(tracker.iter_by_state(SeqState.DECODING)):
+                    tokens, terminal, error = output_buffer.snapshot(req.req_id)
+                    if tokens:
+                        tracker.record_first_token(req.req_id)
+                    if terminal or error:
+                        tracker.transition(req.req_id, SeqState.FINISHED)
+                        continue
+                    if now - req.last_output_query_at < output_query_interval_s:
+                        continue
+                    req.last_output_query_at = now
+                    try:
+                        await _reconcile_authoritative_output(
+                            req, tracker, governor.infer_client, output_buffer
+                        )
+                    except Exception:
+                        metrics.increment(
+                            "control_message_error_total",
+                            labels={"operation": "output_authoritative_query"},
+                        )
+            for req in list(tracker.iter_by_state(SeqState.FINISHED)):
+                if await governor.infer_client.cleanup_request(
+                    scheduler, req, abort=False
+                ):
+                    if affinity_coordinator is not None:
+                        affinity_coordinator.terminal_cleanup_complete(req)
+                    governor.finish_request(req.req_id)
+                    tracker.remove(req.req_id)
+                    if output_buffer is not None:
+                        output_buffer.mark_resource_free(req.req_id)
+            # UNKNOWN cleanup keeps the request ledger and quarantined slot.  A
+            # later exact-ref query may close it without inventing a new op.
+            for req in list(tracker.iter_by_state(SeqState.ABORTED)):
+                if await governor.infer_client.cleanup_request(
+                    scheduler, req, abort=True
+                ):
+                    if affinity_coordinator is not None:
+                        affinity_coordinator.terminal_cleanup_complete(req)
+                    governor.finish_request(req.req_id)
+                    tracker.remove(req.req_id)
+                    if output_buffer is not None:
+                        await output_buffer.fail(req.req_id, "request_aborted")
+                        output_buffer.mark_resource_free(req.req_id)
 
         for req in tracker.get_stuck_decodes(decode_timeout_s):
             await _join_canonical_cleanup(
@@ -721,6 +1078,38 @@ async def _canonical_cleanup(
     from prism_serve.scheduler.sequence_state import SeqState
 
     if tracker.get(req.req_id) is not req:
+        return
+    if req.state == SeqState.PREFILLING and req.publish_outcome in {
+        "UNKNOWN", "NOT_STARTED",
+    }:
+        tracker.metrics.increment(
+            "operation_cancelled_before_arrival_total",
+            labels={
+                "endpoint": "dispatch.prefill",
+                "publish_outcome": req.publish_outcome,
+            },
+        )
+    if _uses_week12_network_control(governor):
+        if req.prefill_instance:
+            scheduler.on_prefill_done(
+                req.prefill_instance, req.prefill_instance_epoch
+            )
+        released = await governor.infer_client.cleanup_request(
+            scheduler, req, abort=True
+        )
+        if released:
+            # UNKNOWN remote state still owns the transfer ledger and both
+            # pair/destination byte credits. Releasing those credits before
+            # exact-ref terminal/finalize proof could admit a second writer.
+            governor.finish_request(req.req_id)
+        if tracker.get(req.req_id) is req:
+            if req.state not in {SeqState.FINISHED, SeqState.ABORTED}:
+                tracker.transition(req.req_id, SeqState.ABORTED)
+            if released:
+                tracker.remove(req.req_id)
+        current = asyncio.current_task()
+        if current is not None:
+            tracker.clear_cleanup_task(req.req_id, current)
         return
     if req.state == SeqState.PREFILLING and req.publish_outcome == "UNKNOWN":
         p_epoch_matches = scheduler.epoch_matches(
@@ -1026,6 +1415,8 @@ def _on_kv_done(
     tracker: "RequestTracker",
     scheduler: "PDScheduler",
     metrics,
+    output_buffer=None,
+    target_request_commit_ref=None,
 ) -> None:
     """Called by TransferGovernor._on_complete when KV reaches the D instance."""
     from prism_serve.scheduler.sequence_state import SeqState
@@ -1041,7 +1432,59 @@ def _on_kv_done(
     ):
         # Recompute or abort made this callback stale.
         return
-    tracker.transition(req_id, SeqState.DECODING)
+    if req.active_operation_id:
+        scheduler.commit_decode_slot(req.active_operation_id)
+    tracker.transition(
+        req_id, SeqState.DECODING,
+        target_request_commit_ref=target_request_commit_ref,
+    )
+    if output_buffer is not None:
+        tokens, terminal, error = output_buffer.snapshot(req_id)
+        if tokens:
+            tracker.record_first_token(req_id)
+        if terminal or error:
+            tracker.transition(req_id, SeqState.FINISHED)
+
+
+async def _reconcile_authoritative_output(
+    req, tracker: "RequestTracker", infer_client, output_buffer
+) -> None:
+    """Advance tracker only from the exact request operation and worker epoch."""
+    from prism_serve.gateway.output import output_query_identity
+    from prism_serve.scheduler.sequence_state import SeqState
+    identity = output_query_identity(req)
+    if identity is None:
+        raise ValueError("output query is not ready")
+    instance_id, instance_epoch, req_id, operation_id = identity
+    tokens, _terminal, _error = output_buffer.snapshot(req_id)
+    value = await infer_client.request_output(
+        instance_id, req_id, len(tokens)
+    )
+    still_current = lambda: (
+        tracker.get(req_id) is req
+        and output_query_identity(req) == identity
+    )
+    if (
+        not still_current()
+        or value.get("req_id") != req_id
+        or value.get("instance_epoch") != instance_epoch
+        or value.get("operation_id") != operation_id
+    ):
+        raise ValueError("output query identity changed")
+    await output_buffer.apply_cumulative(
+        req_id, list(value.get("token_ids", ())),
+        int(value.get("output_seq_no", -1)),
+        terminal=bool(value.get("terminal", False)),
+        error=value.get("error"),
+        still_current=still_current,
+    )
+    current_tokens, current_terminal, current_error = output_buffer.snapshot(
+        req_id
+    )
+    if current_tokens:
+        tracker.record_first_token(req_id)
+    if current_terminal or current_error:
+        tracker.transition(req_id, SeqState.FINISHED)
 
 
 async def _trigger_recompute_epoch_fenced(
@@ -1056,7 +1499,9 @@ async def _trigger_recompute_epoch_fenced(
         return False
     result = governor.trigger_recompute(req.req_id, req.decode_instance)
     if inspect.isawaitable(result):
-        await result
+        result = await result
+    if result is False:
+        return False
     return scheduler.epoch_matches(
         req.decode_instance, req.decode_instance_epoch
     )

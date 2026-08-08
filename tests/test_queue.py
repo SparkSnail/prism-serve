@@ -49,6 +49,39 @@ def test_subjects_are_scoped_to_target_and_owner():
     assert q.dispatch_subject("p-0") == "dispatch_prefill.p-0"
     assert q.reply_subject("prefill_done") == "prefill_done.serve-0--boot-1"
     assert q.reply_subject("decode_done") == "decode_done.serve-0--boot-1"
+    assert (
+        q.reply_subject("suffix_prefill_done")
+        == "suffix_prefill_done.serve-0--boot-1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_suffix_prefill_done_owner_subscription(monkeypatch):
+    subscriptions = []
+
+    class FakeConnection:
+        is_connected = True
+
+        async def subscribe(self, subject, cb):
+            subscriptions.append((subject, cb))
+
+    async def connect(*args, **kwargs):
+        return FakeConnection()
+
+    class FakeNats:
+        pass
+
+    fake = FakeNats()
+    fake.connect = connect
+    monkeypatch.setitem(__import__("sys").modules, "nats", fake)
+    q = NATSQueue(
+        {"scheduler_id": "serve-0", "scheduler_generation": "boot-1"}
+    )
+
+    await q.connect()
+
+    subjects = {subject for subject, _ in subscriptions}
+    assert "suffix_prefill_done.serve-0--boot-1" in subjects
 
 
 @pytest.mark.parametrize("bad_id", ["", "serve.0", "serve *", "serve>"])
@@ -65,6 +98,27 @@ def test_process_restart_changes_owner_for_same_pod_uid():
         "scheduler_id": "pod-uid", "scheduler_generation": "boot-2",
     }, use_mock=True)
     assert first.owner_id != second.owner_id
+
+
+def test_mock_queue_is_never_permanently_closed():
+    assert make_queue().is_permanently_closed is False
+
+
+@pytest.mark.parametrize(
+    ("connection", "expected"),
+    [
+        (None, True),
+        (type("Connection", (), {"is_closed": False})(), False),
+        (type("Connection", (), {"is_closed": True})(), True),
+    ],
+)
+def test_real_queue_reports_terminal_client_closure(connection, expected):
+    queue = NATSQueue({
+        "scheduler_id": "serve-0", "scheduler_generation": "boot-1",
+    })
+    queue._nc = connection
+
+    assert queue.is_permanently_closed is expected
 
 
 @pytest.mark.asyncio

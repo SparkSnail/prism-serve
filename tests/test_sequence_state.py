@@ -1,4 +1,7 @@
 """Unit tests for sequence_state.py (SeqState, RequestInfo, RequestTracker)."""
+
+from __future__ import annotations
+
 import time
 import pytest
 from unittest.mock import MagicMock
@@ -130,7 +133,11 @@ def test_record_first_token_is_idempotent():
     first_token_at = req.first_token_at
     assert tracker.record_first_token("R1") is False
     assert req.first_token_at == first_token_at
-    metrics.observe.assert_called_once()
+    assert metrics.observe.call_count == 2
+    assert metrics.observe.call_args_list[1].args[0] == (
+        "gateway_first_token_stage_latency_ms"
+    )
+    assert metrics.observe.call_args_list[1].kwargs["labels"] == {"path": "cold"}
 
 
 def test_is_stuck_kv_pending():

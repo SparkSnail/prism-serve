@@ -31,6 +31,8 @@ class RequestInfo:
     state: SeqState = SeqState.WAITING
     fingerprint: object | None = None
     sampling_params: dict = field(default_factory=dict)
+    token_ids: list[int] = field(default_factory=list)
+    model: str = ""
 
     prefill_instance: str = ""
     decode_instance:  str = ""
@@ -38,15 +40,18 @@ class RequestInfo:
     decode_instance_epoch: str = ""
 
     arrived_at:    float = field(default_factory=time.monotonic)
-    prefill_start: float = 0.0   # when dispatch_prefill was sent
-    kv_sent_at:    float = 0.0   # when TransferGovernor submitted transfer
+    prefill_start: float = 0.0
+    kv_sent_at:    float = 0.0
     recompute_start: float = 0.0
-    decode_start:  float = 0.0   # when D side started decoding
+    decode_start:  float = 0.0
     first_token_at: float = 0.0
-    finished_at:   float = 0.0   # when request completed
+    last_output_query_at: float = 0.0
+    finished_at:   float = 0.0
 
-    recompute_count: int = 0     # times recompute has been triggered
+
+    recompute_count: int = 0
     dispatch_attempts: int = 0
+
 
     kv_size_bytes: int = 0
     block_table:   list[int] = field(default_factory=list)
@@ -55,11 +60,22 @@ class RequestInfo:
     decode_slot_lease_id: str = ""
     cache_source: str = ""
     cached_prefix_tokens: int = 0
+    correctness_path: str = ""
+    correctness_source_instance: str = ""
+    correctness_target_instance: str = ""
+    correctness_cached_prefix_tokens: int = 0
     affinity_started_at: float = 0.0
     prefix_ready_at: float = 0.0
     suffix_prefill_started_at: float = 0.0
     command_id: str = ""
     publish_outcome: str = "NOT_STARTED"
+    dispatch_operation_ref: object | None = None
+    suffix_operation_ref: object | None = None
+    target_request_ref: object | None = None
+    target_request_commit_ref: object | None = None
+    target_block_table: list[int] = field(default_factory=list)
+    transfer_source_ref: object | None = None
+    transfer_target_ref: object | None = None
 
     def ttft_ms(self) -> float:
         """Return first-token latency in milliseconds, or -1 if unknown."""
@@ -127,10 +143,23 @@ class InstanceSlot:
 class TransferTask:
     """KV transfer work item with flow-control metadata."""
     req_id:      str
-    src:         str           # P instance ID
-    dst:         str           # D instance ID
-    kv_size:     int           # bytes to transfer (used for flow-control)
-    priority:    int = 1       # 1 = normal PD; 0 = migration/replica (stricter cap)
+    src:         str
+    dst:         str
+    kv_size:     int
+    operation_id: str = ""
+    src_epoch: str = ""
+    dst_epoch: str = ""
+    src_block_ids: tuple[int, ...] = ()
+    dst_block_ids: tuple[int, ...] = ()
+    target_request_ref: object | None = None
+    target_request_commit_ref: object | None = None
+    token_ids: tuple[int, ...] = ()
+    sampling_params: dict = field(default_factory=dict)
+    first_token: int | None = None
+    transfer_source_ref: object | None = None
+    transfer_target_ref: object | None = None
+    correctness_path: str = ""
+    priority:    int = 1
     enqueued_at: float = field(default_factory=time.monotonic)
     on_complete: object = None  # Callable[[], None] | None
     operation_id: str = ""
@@ -197,6 +226,14 @@ class RequestTracker:
 
     def cleanup_task(self, req_id: str) -> asyncio.Task | None:
         return self._cleanup_tasks.get(req_id)
+
+    async def quiesce_cleanup_tasks(self) -> None:
+        """Cancel and join every supervisor cleanup before replacement freeze."""
+        tasks = list(self._cleanup_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def clear_cleanup_task(self, req_id: str, task: asyncio.Task) -> None:
         if self._cleanup_tasks.get(req_id) is task:
@@ -276,6 +313,13 @@ class RequestTracker:
         req.first_token_at = time.monotonic()
         self.metrics.observe(
             "request_ttft_ms", req.ttft_ms(), labels={"state": "DECODING"}
+        )
+        self.metrics.observe(
+            "gateway_first_token_stage_latency_ms",
+            req.ttft_ms(),
+            labels={
+                "path": "affinity" if req.cached_prefix_tokens > 0 else "cold"
+            },
         )
         return True
 

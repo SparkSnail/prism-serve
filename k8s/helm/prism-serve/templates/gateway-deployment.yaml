@@ -17,6 +17,10 @@ spec:
       labels:
         {{- include "prism-serve.gateway.selectorLabels" . | nindent 8 }}
     spec:
+      terminationGracePeriodSeconds: {{ .Values.gateway.terminationGracePeriodSeconds }}
+      {{- if .Values.gateway.correctnessHarness.enabled }}
+      shareProcessNamespace: true
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -42,6 +46,80 @@ spec:
                   fieldPath: metadata.uid
             - name: PRISM_SERVE_CONTROL_PLANE_REPLICA_COUNT
               value: {{ .Values.gateway.replicas | quote }}
+            - name: PRISM_SERVE_MULTINODE_E2E_ENABLED
+              value: "true"
+            - name: PRISM_SERVE_WORKER_TOPOLOGY_PATH
+              value: /etc/prism/topology/topology.json
+            - name: PRISM_SERVE_REQUIRE_GPUDIRECT_RDMA
+              value: {{ .Values.worker.requireGpudirectRdma | quote }}
+            - name: PRISM_SERVE_AFFINITY_ENABLED
+              value: {{ .Values.affinity.enabled | quote }}
+            - name: PRISM_SERVE_CORRECTNESS_HARNESS_ENABLED
+              value: {{ .Values.gateway.correctnessHarness.enabled | quote }}
+            - name: PRISM_SERVE_CORRECTNESS_FAULT_GATE_TIMEOUT_S
+              value: {{ .Values.gateway.correctnessHarness.faultGateTimeoutSeconds | quote }}
+            {{- if .Values.gateway.correctnessHarness.enabled }}
+            - name: PRISM_SERVE_CORRECTNESS_HARNESS_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "gateway.correctnessHarness.secretName is required when enabled" .Values.gateway.correctnessHarness.secretName | quote }}
+                  key: {{ required "gateway.correctnessHarness.secretKey is required when enabled" .Values.gateway.correctnessHarness.secretKey | quote }}
+            - name: PRISM_SERVE_PROCESS_IDENTITY_PATH
+              value: /tmp/prism-gateway-process-identity.json
+            {{- end }}
+            - name: PRISM_SERVE_PREFIX_BLOCK_BYTES
+              value: {{ .Values.model.kvBlockBytes | int64 | quote }}
+            - name: PRISM_SERVE_PREFIX_BLOCK_SIZE
+              value: {{ .Values.model.tokensPerBlock | quote }}
+            - name: PRISM_SERVE_TOKENIZER_MODEL
+              value: {{ .Values.model.localPath | quote }}
+            - name: PRISM_SERVE_TOKENIZER_REVISION
+              value: {{ .Values.model.tokenizerRevision | quote }}
+            - name: PRISM_SERVE_CHAT_TEMPLATE_VERSION
+              value: "v1"
+            - name: PRISM_SERVE_KV_COMPATIBILITY_ID
+              value: {{ .Values.model.kvCompatibilityId | quote }}
+            - name: PRISM_SERVE_MODEL_PROFILE_ID
+              value: {{ .Values.model.profileId | quote }}
+            - name: PRISM_SERVE_MODEL_ID
+              value: {{ .Values.model.id | quote }}
+            - name: PRISM_SERVE_MODEL_REVISION
+              value: {{ .Values.model.revision | quote }}
+            - name: PRISM_SERVE_MODEL_CONFIG_SHA256
+              value: {{ .Values.model.configSha256 | quote }}
+            - name: PRISM_SERVE_RUNTIME_DTYPE
+              value: {{ .Values.model.dtype | quote }}
+            - name: PRISM_SERVE_TENSOR_PARALLEL_SIZE
+              value: {{ .Values.parallel.tp_size | quote }}
+            - name: PRISM_SERVE_KV_LAYOUT
+              value: {{ .Values.model.kvLayout | quote }}
+            - name: PRISM_SERVE_KV_BLOCK_BYTES
+              value: {{ .Values.model.kvBlockBytes | int64 | quote }}
+            - name: PRISM_SERVE_MAX_BYTES_INFLIGHT_PER_PAIR
+              value: {{ .Values.worker.maxBytesInflightPerPair | int64 | quote }}
+            - name: PRISM_SERVE_REPLACEMENT_STORE_PATH
+              value: {{ .Values.gateway.replacementStore.path | quote }}
+            - name: PRISM_SERVE_REPLACEMENT_STORE_MAX_RECORDS_PER_RUN
+              value: {{ .Values.gateway.replacementStore.maxRecordsPerRun | quote }}
+            - name: PRISM_SERVE_REPLACEMENT_STORE_SEAL_RETENTION
+              value: {{ .Values.gateway.replacementStore.sealRetention | quote }}
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+          volumeMounts:
+            - name: worker-topology
+              mountPath: /etc/prism/topology
+              readOnly: true
+            - name: replacement-store
+              mountPath: {{ .Values.gateway.replacementStore.path | quote }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: {{ .Values.gateway.startupProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.gateway.startupProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.gateway.startupProbe.failureThreshold }}
           livenessProbe:
             httpGet:
               path: /healthz
@@ -56,6 +134,13 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.gateway.resources | nindent 12 }}
+      volumes:
+        - name: worker-topology
+          configMap:
+            name: {{ include "prism-serve.fullname" . }}-worker-topology
+        - name: replacement-store
+          persistentVolumeClaim:
+            claimName: {{ include "prism-serve.fullname" . }}-replacement-store
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
