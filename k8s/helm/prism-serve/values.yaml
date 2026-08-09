@@ -15,6 +15,15 @@ model:
   tokensPerBlock: 256
   kvBlockBytes: 29360128
   kvCompatibilityId: a305c48442086f050a0f703c9e79e6e4596c52eaf5dd9f9015cc1a744c1b5b19
+  numHiddenLayers: 28
+  numKeyValueHeads: 8
+  headDim: 128
+  ropeTheta: "1000000.0"
+  maxModelLen: 4096
+  maxNumBatchedTokens: 16384
+  maxNumSeqs: 512
+  gpuMemoryUtilization: 0.9
+  enforceEager: false
 parallel:
   tp_size: 1
   ep_size: 1
@@ -38,6 +47,11 @@ gateway:
     secretName: ""
     secretKey: token
     faultGateTimeoutSeconds: 1200
+  performanceHarness:
+    enabled: false
+  routeParityHarness:
+    enabled: false
+  performanceTraceCap: 8192
   image:
     repository: sparksnail/prism-serve
     tag: "week12-unpublished" # override with an immutable source-revision tag
@@ -99,7 +113,7 @@ worker:
   port: 8001
   gpu:
     count: 1
-    type: a100-80g     # documentation only; scheduling uses nodeGroups labels
+    type: l20          # documentation only; scheduling uses nodeGroups labels
   resources:
     requests:
       cpu: "4"

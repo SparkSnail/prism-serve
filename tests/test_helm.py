@@ -35,6 +35,26 @@ def _render_chart(*args: str) -> str:
     ).stdout
 
 
+def _performance_values() -> Path:
+    return (
+        Path(__file__).parents[1]
+        / "k8s"
+        / "helm"
+        / "prism-serve"
+        / "values-performance.yaml"
+    )
+
+
+def _performance_on_values() -> Path:
+    return (
+        Path(__file__).parents[1]
+        / "k8s"
+        / "helm"
+        / "prism-serve"
+        / "values-performance-on.yaml"
+    )
+
+
 def _manifest_int(document: str, key: str) -> int:
     match = re.search(rf"^\s*{re.escape(key)}:\s*(\d+)\s*$", document, re.MULTILINE)
     assert match is not None, f"missing rendered integer: {key}"
@@ -316,3 +336,104 @@ def test_world_restart_patch_keeps_gateway_unchanged_and_workers_zero_until_star
     )
     assert persisted_topology["topology_generation"] == generation
     assert persisted_topology["accepted_topology_generation"] == generation
+
+
+def test_exact_model_profiles_render_geometry_and_runtime_fields() -> None:
+    correctness = _render_chart()
+    performance = _render_chart("-f", str(_performance_values()))
+
+    for rendered, layers, block_bytes, max_num_seqs in (
+        (correctness, "28", "29360128", "512"),
+        (performance, "36", "37748736", "128"),
+    ):
+        gateway_fields = {
+            "PRISM_SERVE_MODEL_NUM_HIDDEN_LAYERS": layers,
+            "PRISM_SERVE_MODEL_NUM_KEY_VALUE_HEADS": "8",
+            "PRISM_SERVE_MODEL_HEAD_DIM": "128",
+            "PRISM_SERVE_MODEL_ROPE_THETA": "1000000.0",
+            "PRISM_SERVE_MAX_MODEL_LEN": "4096",
+            "PRISM_SERVE_MAX_NUM_BATCHED_TOKENS": "16384",
+            "PRISM_SERVE_MAX_NUM_SEQS": max_num_seqs,
+            "PRISM_SERVE_GPU_MEMORY_UTILIZATION": "0.9",
+            "PRISM_SERVE_ENFORCE_EAGER": "false",
+            "PRISM_SERVE_KV_BLOCK_BYTES": block_bytes,
+        }
+        worker_fields = {
+            "PRISM_MODEL_NUM_HIDDEN_LAYERS": layers,
+            "PRISM_MODEL_NUM_KEY_VALUE_HEADS": "8",
+            "PRISM_MODEL_HEAD_DIM": "128",
+            "PRISM_MODEL_ROPE_THETA": "1000000.0",
+            "PRISM_MAX_MODEL_LEN": "4096",
+            "PRISM_MAX_NUM_BATCHED_TOKENS": "16384",
+            "PRISM_MAX_NUM_SEQS": max_num_seqs,
+            "PRISM_GPU_MEMORY_UTILIZATION": "0.9",
+            "PRISM_ENFORCE_EAGER": "false",
+            "PRISM_KV_BLOCK_BYTES": block_bytes,
+        }
+        for name, value in gateway_fields.items():
+            assert rendered.count(
+                f'- name: {name}\n              value: "{value}"'
+            ) == 1
+        for name, value in worker_fields.items():
+            assert rendered.count(
+                f'- name: {name}\n              value: "{value}"'
+            ) == 4
+
+
+def test_performance_overlay_enables_parity_without_fault_authority() -> None:
+    off = _render_chart("-f", str(_performance_values()))
+    on = _render_chart(
+        "-f", str(_performance_values()), "-f", str(_performance_on_values())
+    )
+
+    assert off.count(
+        '- name: PRISM_SERVE_CORRECTNESS_HARNESS_ENABLED\n'
+        '              value: "false"'
+    ) == 1
+    assert off.count(
+        '- name: PRISM_SERVE_PERFORMANCE_HARNESS_ENABLED\n'
+        '              value: "true"'
+    ) == 1
+    assert off.count(
+        '- name: PRISM_SERVE_ROUTE_PARITY_HARNESS_ENABLED\n'
+        '              value: "true"'
+    ) == 1
+    assert off.count(
+        '- name: PRISM_SERVE_PERFORMANCE_TRACE_CAP\n'
+        '              value: "8192"'
+    ) == 1
+    for rendered, affinity in ((off, "false"), (on, "true")):
+        assert "shareProcessNamespace:" not in rendered
+        assert "PRISM_SERVE_PROCESS_IDENTITY_PATH" not in rendered
+        assert "PRISM_PROCESS_IDENTITY_PATH" not in rendered
+        assert rendered.count("PRISM_SERVE_CORRECTNESS_HARNESS_SECRET") == 1
+        assert rendered.count('value: "qwen3-8b-bf16-tp1"') == 5
+        assert rendered.count('value: "Qwen/Qwen3-8B"') == 5
+        assert rendered.count(
+            '- name: PRISM_SERVE_AFFINITY_ENABLED\n'
+            f'              value: "{affinity}"'
+        ) == 1
+
+
+def test_schema_rejects_hybrid_profile_and_fault_performance_overlap() -> None:
+    chart = Path(__file__).parents[1] / "k8s" / "helm" / "prism-serve"
+    base = [
+        "helm", "template", "week12", str(chart),
+        "-f", str(_performance_values()),
+    ]
+    hybrid = subprocess.run(
+        [*base, "--set", "model.numHiddenLayers=28"],
+        capture_output=True,
+        text=True,
+    )
+    overlap = subprocess.run(
+        [*base, "--set", "gateway.correctnessHarness.enabled=true"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert hybrid.returncode != 0
+    assert "oneOf" in hybrid.stderr
+    assert "numHiddenLayers" in hybrid.stderr
+    assert overlap.returncode != 0
+    assert "correctnessHarness" in overlap.stderr

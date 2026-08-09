@@ -1,0 +1,3 @@
+# Layer after values-performance.yaml for the affinity-on performance world.
+affinity:
+  enabled: true

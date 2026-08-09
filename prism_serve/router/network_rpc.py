@@ -317,6 +317,7 @@ class NetworkControlRPC:
         block_bytes: int = 0,
         active_operation_cap: int = 512,
         terminal_snapshot_cap: int = 4096,
+        gateway_clock_epoch: str = "",
         metrics=None,
     ) -> None:
         if active_operation_cap <= 0 or terminal_snapshot_cap <= 0:
@@ -330,6 +331,7 @@ class NetworkControlRPC:
         self.block_bytes = block_bytes
         self.active_operation_cap = active_operation_cap
         self.terminal_snapshot_cap = terminal_snapshot_cap
+        self.gateway_clock_epoch = gateway_clock_epoch
         self.metrics = metrics
         self._refs: dict[tuple[str, str, str], EndpointOperationRef] = {}
 
@@ -646,13 +648,19 @@ class NetworkControlRPC:
         }
 
     def require_correctness_evidence(self, req_id: str) -> None:
+        self.require_request_evidence(req_id)
+
+    def require_request_evidence(self, req_id: str) -> None:
         if req_id not in self._correctness_operations \
                 and len(self._correctness_operations) >= self.active_operation_cap:
-            raise RuntimeError("correctness evidence capacity exhausted")
+            raise RuntimeError("request evidence capacity exhausted")
         self._correctness_required.add(req_id)
         self._correctness_operations.add(req_id)
 
     def cancel_correctness_evidence(self, req_id: str) -> None:
+        self.cancel_request_evidence(req_id)
+
+    def cancel_request_evidence(self, req_id: str) -> None:
         self._correctness_required.discard(req_id)
         self._discard_correctness_request_if_unowned(req_id)
 
@@ -761,6 +769,7 @@ class NetworkControlRPC:
 
     async def _run_normal_transfer(self, task, on_complete) -> None:
         transfer_started = time.monotonic()
+        transfer_started_ns = time.monotonic_ns()
         mapping = {
             "req_id": task.req_id,
             "source_instance": task.src,
@@ -793,6 +802,7 @@ class NetworkControlRPC:
             target_ref=target_ref,
             target_payload=target_payload,
         )
+        transfer_terminal_ns = time.monotonic_ns()
         if self.metrics is not None:
             labels = {"pair": f"{task.src}--{task.dst}", "path": "normal"}
             self.metrics.observe(
@@ -852,6 +862,9 @@ class NetworkControlRPC:
                 "completed_bytes": completed_bytes,
                 "work_terminal": work_terminal,
                 "cuda_terminal": cuda_terminal,
+                "gateway_clock_epoch": self.gateway_clock_epoch,
+                "transfer_started_ns": transfer_started_ns,
+                "transfer_terminal_ns": transfer_terminal_ns,
                 "source_endpoint_ref": asdict(source_ref),
                 "target_endpoint_ref": asdict(target_ref),
                 "source_terminal": source_terminal,
@@ -1075,6 +1088,7 @@ class NetworkControlRPC:
         source_ref = self._allocate("transfer.source", plan.source_instance, plan.operation_id, mapping)
         self._bind_correctness_operation(plan.operation_id, plan.req_id)
         try:
+            transfer_started_ns = time.monotonic_ns()
             target_terminal, source_terminal = await self._run_nccl_pair(
                 source_instance=plan.source_instance,
                 source_ref=source_ref,
@@ -1083,6 +1097,7 @@ class NetworkControlRPC:
                 target_ref=target_ref,
                 target_payload=mapping,
             )
+            transfer_terminal_ns = time.monotonic_ns()
             if plan.req_id in self._correctness_required:
                 completed_bytes, work_terminal, cuda_terminal = self._terminal_transfer_facts(
                     source_terminal, target_terminal
@@ -1102,6 +1117,9 @@ class NetworkControlRPC:
                     "completed_bytes": completed_bytes,
                     "work_terminal": work_terminal,
                     "cuda_terminal": cuda_terminal,
+                    "gateway_clock_epoch": self.gateway_clock_epoch,
+                    "transfer_started_ns": transfer_started_ns,
+                    "transfer_terminal_ns": transfer_terminal_ns,
                     "source_endpoint_ref": asdict(source_ref),
                     "target_endpoint_ref": asdict(target_ref),
                     "source_terminal": source_terminal,
@@ -1150,6 +1168,9 @@ class NetworkControlRPC:
                 "completed_bytes": 0,
                 "work_terminal": True,
                 "cuda_terminal": True,
+                "gateway_clock_epoch": self.gateway_clock_epoch,
+                "transfer_started_ns": None,
+                "transfer_terminal_ns": None,
                 "commit_endpoint_ref": asdict(ref),
             })
 

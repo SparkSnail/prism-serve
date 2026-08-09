@@ -1,3 +1,4 @@
+{{- $operatorHarnessEnabled := or .Values.gateway.correctnessHarness.enabled .Values.gateway.performanceHarness.enabled .Values.gateway.routeParityHarness.enabled -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -56,14 +57,22 @@ spec:
               value: {{ .Values.affinity.enabled | quote }}
             - name: PRISM_SERVE_CORRECTNESS_HARNESS_ENABLED
               value: {{ .Values.gateway.correctnessHarness.enabled | quote }}
+            - name: PRISM_SERVE_PERFORMANCE_HARNESS_ENABLED
+              value: {{ .Values.gateway.performanceHarness.enabled | quote }}
+            - name: PRISM_SERVE_ROUTE_PARITY_HARNESS_ENABLED
+              value: {{ .Values.gateway.routeParityHarness.enabled | quote }}
+            - name: PRISM_SERVE_PERFORMANCE_TRACE_CAP
+              value: {{ .Values.gateway.performanceTraceCap | quote }}
             - name: PRISM_SERVE_CORRECTNESS_FAULT_GATE_TIMEOUT_S
               value: {{ .Values.gateway.correctnessHarness.faultGateTimeoutSeconds | quote }}
-            {{- if .Values.gateway.correctnessHarness.enabled }}
+            {{- if $operatorHarnessEnabled }}
             - name: PRISM_SERVE_CORRECTNESS_HARNESS_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ required "gateway.correctnessHarness.secretName is required when enabled" .Values.gateway.correctnessHarness.secretName | quote }}
                   key: {{ required "gateway.correctnessHarness.secretKey is required when enabled" .Values.gateway.correctnessHarness.secretKey | quote }}
+            {{- end }}
+            {{- if .Values.gateway.correctnessHarness.enabled }}
             - name: PRISM_SERVE_PROCESS_IDENTITY_PATH
               value: /tmp/prism-gateway-process-identity.json
             {{- end }}
@@ -87,6 +96,14 @@ spec:
               value: {{ .Values.model.revision | quote }}
             - name: PRISM_SERVE_MODEL_CONFIG_SHA256
               value: {{ .Values.model.configSha256 | quote }}
+            - name: PRISM_SERVE_MODEL_NUM_HIDDEN_LAYERS
+              value: {{ .Values.model.numHiddenLayers | quote }}
+            - name: PRISM_SERVE_MODEL_NUM_KEY_VALUE_HEADS
+              value: {{ .Values.model.numKeyValueHeads | quote }}
+            - name: PRISM_SERVE_MODEL_HEAD_DIM
+              value: {{ .Values.model.headDim | quote }}
+            - name: PRISM_SERVE_MODEL_ROPE_THETA
+              value: {{ .Values.model.ropeTheta | quote }}
             - name: PRISM_SERVE_RUNTIME_DTYPE
               value: {{ .Values.model.dtype | quote }}
             - name: PRISM_SERVE_TENSOR_PARALLEL_SIZE
@@ -95,6 +112,16 @@ spec:
               value: {{ .Values.model.kvLayout | quote }}
             - name: PRISM_SERVE_KV_BLOCK_BYTES
               value: {{ .Values.model.kvBlockBytes | int64 | quote }}
+            - name: PRISM_SERVE_MAX_MODEL_LEN
+              value: {{ .Values.model.maxModelLen | quote }}
+            - name: PRISM_SERVE_MAX_NUM_BATCHED_TOKENS
+              value: {{ .Values.model.maxNumBatchedTokens | quote }}
+            - name: PRISM_SERVE_MAX_NUM_SEQS
+              value: {{ .Values.model.maxNumSeqs | quote }}
+            - name: PRISM_SERVE_GPU_MEMORY_UTILIZATION
+              value: {{ .Values.model.gpuMemoryUtilization | quote }}
+            - name: PRISM_SERVE_ENFORCE_EAGER
+              value: {{ .Values.model.enforceEager | quote }}
             - name: PRISM_SERVE_MAX_BYTES_INFLIGHT_PER_PAIR
               value: {{ .Values.worker.maxBytesInflightPerPair | int64 | quote }}
             - name: PRISM_SERVE_REPLACEMENT_STORE_PATH

@@ -46,6 +46,10 @@ class Settings(BaseSettings):
 
     # Kubernetes Secret; it is never accepted from a request body or chart value.
     correctness_harness_enabled: bool = False
+    # Performance and route parity share auth but never enable fault injection.
+    performance_harness_enabled: bool = False
+    route_parity_harness_enabled: bool = False
+    performance_trace_cap: int = 8192
     correctness_harness_secret: str = ""
     correctness_fault_gate_timeout_s: float = 1200.0
     resource_report_stale_after_s: float = 2.0
@@ -67,6 +71,11 @@ class Settings(BaseSettings):
     model_num_key_value_heads: int = 8
     model_head_dim: int = 128
     model_rope_theta: float = 1_000_000.0
+    max_model_len: int = 4096
+    max_num_batched_tokens: int = 16384
+    max_num_seqs: int = 512
+    gpu_memory_utilization: float = 0.9
+    enforce_eager: bool = False
     tokenizer_model: str = ""
     tokenizer_revision: str = "9d4bfd9a94aa5f2ab18d77fa457c306da0b8e439"
     chat_template_version: str = "v1"

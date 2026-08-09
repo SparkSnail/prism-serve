@@ -1,0 +1,45 @@
+# Fixed Qwen3-8B BF16 profile for the 2P2D L20 performance campaign.
+model:
+  profileId: qwen3-8b-bf16-tp1
+  id: Qwen/Qwen3-8B
+  localPath: /opt/models/Qwen3-8B
+  revision: b968826d9c46dd6066d109eabc6255188de91218
+  tokenizerRevision: b968826d9c46dd6066d109eabc6255188de91218
+  configSha256: f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30
+  dtype: bfloat16
+  kvLayout: NHDC
+  tokensPerBlock: 256
+  kvBlockBytes: 37748736
+  kvCompatibilityId: 2647222531d143800a56551dbe8d030c535a1bb2e0e47ff2a12f0781964f4c6c
+  numHiddenLayers: 36
+  numKeyValueHeads: 8
+  headDim: 128
+  ropeTheta: "1000000.0"
+  maxModelLen: 4096
+  maxNumBatchedTokens: 16384
+  maxNumSeqs: 128
+  gpuMemoryUtilization: 0.9
+  enforceEager: false
+
+gateway:
+  correctnessHarness:
+    enabled: false
+    secretName: week12-harness
+    secretKey: token
+    faultGateTimeoutSeconds: 1200
+  performanceHarness:
+    enabled: true
+  routeParityHarness:
+    enabled: true
+  performanceTraceCap: 8192
+  image:
+    tag: week12-perf-qwen3-8b-unpublished
+
+worker:
+  image:
+    tag: week12-perf-qwen3-8b-unpublished
+  gpu:
+    type: l20
+
+affinity:
+  enabled: false

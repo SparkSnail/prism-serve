@@ -177,6 +177,7 @@ def _run_gateway(gateway_port: int, nats_url: str) -> None:
         "PRISM_SERVE_NATS_REQUIRED": "true",
         "PRISM_SERVE_GATEWAY_POD_UID": "gateway-a",
         "PRISM_SERVE_GATEWAY_PROCESS_GENERATION": "boot-1",
+        "PRISM_SERVE_MODEL_ID": "local-control-plane",
         "PRISM_SERVE_SCHEDULE_LOOP_TICK_MS": "5",
         "PRISM_SERVE_GOVERNOR_TICK_S": "0.05",
     })

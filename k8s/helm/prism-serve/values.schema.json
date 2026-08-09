@@ -1,9 +1,15 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
+  "required": ["model", "parallel", "gateway", "worker", "affinity"],
   "properties": {
     "gateway": {
       "type": "object",
+      "required": [
+        "replicas", "terminationGracePeriodSeconds", "startupProbe",
+        "topologyGeneration", "correctnessHarness", "performanceHarness",
+        "routeParityHarness", "performanceTraceCap"
+      ],
       "properties": {
         "replicas": {"const": 1},
         "terminationGracePeriodSeconds": {"const": 255},
@@ -27,38 +33,106 @@
             "enabled": {"type": "boolean"},
             "secretName": {"type": "string"},
             "secretKey": {"type": "string", "minLength": 1},
-            "faultGateTimeoutSeconds": {
-              "type": "number", "minimum": 1200
-            }
+            "faultGateTimeoutSeconds": {"type": "number", "minimum": 1200}
           },
           "additionalProperties": false
-        }
+        },
+        "performanceHarness": {
+          "type": "object",
+          "required": ["enabled"],
+          "properties": {"enabled": {"type": "boolean"}},
+          "additionalProperties": false
+        },
+        "routeParityHarness": {
+          "type": "object",
+          "required": ["enabled"],
+          "properties": {"enabled": {"type": "boolean"}},
+          "additionalProperties": false
+        },
+        "performanceTraceCap": {"const": 8192}
       }
     },
     "parallel": {
       "type": "object",
-      "properties": {"tp_size": {"const": 1}}
+      "required": ["tp_size", "ep_size", "pp_size"],
+      "properties": {
+        "tp_size": {"const": 1},
+        "ep_size": {"const": 1},
+        "pp_size": {"const": 1}
+      },
+      "additionalProperties": false
     },
     "model": {
-      "type": "object",
-      "required": [
-        "profileId", "id", "localPath", "revision", "tokenizerRevision",
-        "configSha256", "dtype", "kvLayout", "tokensPerBlock",
-        "kvBlockBytes", "kvCompatibilityId"
-      ],
-      "properties": {
-        "profileId": {"const": "week12-qwen3-0.6b"},
-        "id": {"const": "Qwen/Qwen3-0.6B"},
-        "localPath": {"type": "string", "minLength": 1},
-        "revision": {"type": "string", "minLength": 40},
-        "tokenizerRevision": {"type": "string", "minLength": 40},
-        "configSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "dtype": {"const": "bfloat16"},
-        "kvLayout": {"const": "NHDC"},
-        "tokensPerBlock": {"const": 256},
-        "kvBlockBytes": {"const": 29360128},
-        "kvCompatibilityId": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
-      }
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "profileId", "id", "localPath", "revision", "tokenizerRevision",
+            "configSha256", "dtype", "kvLayout", "tokensPerBlock",
+            "kvBlockBytes", "kvCompatibilityId", "numHiddenLayers",
+            "numKeyValueHeads", "headDim", "ropeTheta", "maxModelLen",
+            "maxNumBatchedTokens", "maxNumSeqs", "gpuMemoryUtilization",
+            "enforceEager"
+          ],
+          "properties": {
+            "profileId": {"const": "week12-qwen3-0.6b"},
+            "id": {"const": "Qwen/Qwen3-0.6B"},
+            "localPath": {"const": "/opt/models/Qwen3-0.6B"},
+            "revision": {"const": "9d4bfd9a94aa5f2ab18d77fa457c306da0b8e439"},
+            "tokenizerRevision": {"const": "9d4bfd9a94aa5f2ab18d77fa457c306da0b8e439"},
+            "configSha256": {"const": "660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd"},
+            "dtype": {"const": "bfloat16"},
+            "kvLayout": {"const": "NHDC"},
+            "tokensPerBlock": {"const": 256},
+            "kvBlockBytes": {"const": 29360128},
+            "kvCompatibilityId": {"const": "a305c48442086f050a0f703c9e79e6e4596c52eaf5dd9f9015cc1a744c1b5b19"},
+            "numHiddenLayers": {"const": 28},
+            "numKeyValueHeads": {"const": 8},
+            "headDim": {"const": 128},
+            "ropeTheta": {"const": "1000000.0"},
+            "maxModelLen": {"const": 4096},
+            "maxNumBatchedTokens": {"const": 16384},
+            "maxNumSeqs": {"const": 512},
+            "gpuMemoryUtilization": {"const": 0.9},
+            "enforceEager": {"const": false}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "profileId", "id", "localPath", "revision", "tokenizerRevision",
+            "configSha256", "dtype", "kvLayout", "tokensPerBlock",
+            "kvBlockBytes", "kvCompatibilityId", "numHiddenLayers",
+            "numKeyValueHeads", "headDim", "ropeTheta", "maxModelLen",
+            "maxNumBatchedTokens", "maxNumSeqs", "gpuMemoryUtilization",
+            "enforceEager"
+          ],
+          "properties": {
+            "profileId": {"const": "qwen3-8b-bf16-tp1"},
+            "id": {"const": "Qwen/Qwen3-8B"},
+            "localPath": {"const": "/opt/models/Qwen3-8B"},
+            "revision": {"const": "b968826d9c46dd6066d109eabc6255188de91218"},
+            "tokenizerRevision": {"const": "b968826d9c46dd6066d109eabc6255188de91218"},
+            "configSha256": {"const": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30"},
+            "dtype": {"const": "bfloat16"},
+            "kvLayout": {"const": "NHDC"},
+            "tokensPerBlock": {"const": 256},
+            "kvBlockBytes": {"const": 37748736},
+            "kvCompatibilityId": {"const": "2647222531d143800a56551dbe8d030c535a1bb2e0e47ff2a12f0781964f4c6c"},
+            "numHiddenLayers": {"const": 36},
+            "numKeyValueHeads": {"const": 8},
+            "headDim": {"const": 128},
+            "ropeTheta": {"const": "1000000.0"},
+            "maxModelLen": {"const": 4096},
+            "maxNumBatchedTokens": {"const": 16384},
+            "maxNumSeqs": {"const": 128},
+            "gpuMemoryUtilization": {"const": 0.9},
+            "enforceEager": {"const": false}
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "worker": {
       "type": "object",
@@ -100,6 +174,106 @@
           }
         }
       }
+    },
+    "affinity": {
+      "type": "object",
+      "required": ["enabled"],
+      "properties": {"enabled": {"type": "boolean"}}
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["gateway"],
+        "properties": {
+          "gateway": {
+            "required": ["performanceHarness"],
+            "properties": {
+              "performanceHarness": {
+                "required": ["enabled"],
+                "properties": {"enabled": {"const": true}}
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "model": {
+            "properties": {"profileId": {"const": "qwen3-8b-bf16-tp1"}}
+          },
+          "gateway": {
+            "properties": {
+              "correctnessHarness": {
+                "properties": {"enabled": {"const": false}}
+              },
+              "routeParityHarness": {
+                "properties": {"enabled": {"const": true}}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["model"],
+        "properties": {
+          "model": {
+            "required": ["profileId"],
+            "properties": {
+              "profileId": {"const": "qwen3-8b-bf16-tp1"}
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "gateway": {
+            "properties": {
+              "correctnessHarness": {
+                "properties": {"enabled": {"const": false}}
+              },
+              "performanceHarness": {
+                "properties": {"enabled": {"const": true}}
+              },
+              "routeParityHarness": {
+                "properties": {"enabled": {"const": true}}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["gateway"],
+        "properties": {
+          "gateway": {
+            "required": ["correctnessHarness"],
+            "properties": {
+              "correctnessHarness": {
+                "required": ["enabled"],
+                "properties": {"enabled": {"const": true}}
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "model": {
+            "properties": {"profileId": {"const": "week12-qwen3-0.6b"}}
+          },
+          "gateway": {
+            "properties": {
+              "performanceHarness": {
+                "properties": {"enabled": {"const": false}}
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
 }

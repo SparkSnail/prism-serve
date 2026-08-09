@@ -5,7 +5,7 @@
 {{- if and (ne (int .Values.worker.replicas) 0) (ne (int .Values.worker.replicas) 1) -}}{{ fail "each fixed 2P2D member must have zero or one replica" }}{{- end -}}
 {{- if ne (int .Values.gateway.replicas) 1 -}}{{ fail "fixed 2P2D profile requires one active Gateway" }}{{- end -}}
 {{- if ne (int .Values.parallel.tp_size) 1 -}}{{ fail "fixed 2P2D profile requires TP=1" }}{{- end -}}
-{{- if ne .Values.model.profileId "week12-qwen3-0.6b" -}}{{ fail "unsupported fixed 2P2D model profile" }}{{- end -}}
+{{- if and (ne .Values.model.profileId "week12-qwen3-0.6b") (ne .Values.model.profileId "qwen3-8b-bf16-tp1") -}}{{ fail "unsupported fixed 2P2D model profile" }}{{- end -}}
 {{- if ne (int .Values.gateway.replacementStore.maxRecordsPerRun) 1024 -}}{{ fail "replacement record cap must be 1024" }}{{- end -}}
 {{- if ne (int .Values.gateway.replacementStore.sealRetention) 2 -}}{{ fail "replacement seal retention must be 2" }}{{- end -}}
 {{- range $index, $member := .Values.worker.members }}
@@ -108,6 +108,14 @@ spec:
               value: {{ $.Values.model.tokenizerRevision | quote }}
             - name: PRISM_MODEL_CONFIG_SHA256
               value: {{ $.Values.model.configSha256 | quote }}
+            - name: PRISM_MODEL_NUM_HIDDEN_LAYERS
+              value: {{ $.Values.model.numHiddenLayers | quote }}
+            - name: PRISM_MODEL_NUM_KEY_VALUE_HEADS
+              value: {{ $.Values.model.numKeyValueHeads | quote }}
+            - name: PRISM_MODEL_HEAD_DIM
+              value: {{ $.Values.model.headDim | quote }}
+            - name: PRISM_MODEL_ROPE_THETA
+              value: {{ $.Values.model.ropeTheta | quote }}
             - name: PRISM_DTYPE
               value: {{ $.Values.model.dtype | quote }}
             - name: PRISM_TP_SIZE
@@ -118,6 +126,16 @@ spec:
               value: {{ $.Values.model.kvBlockBytes | int64 | quote }}
             - name: PRISM_KV_LAYOUT
               value: {{ $.Values.model.kvLayout | quote }}
+            - name: PRISM_MAX_MODEL_LEN
+              value: {{ $.Values.model.maxModelLen | quote }}
+            - name: PRISM_MAX_NUM_BATCHED_TOKENS
+              value: {{ $.Values.model.maxNumBatchedTokens | quote }}
+            - name: PRISM_MAX_NUM_SEQS
+              value: {{ $.Values.model.maxNumSeqs | quote }}
+            - name: PRISM_GPU_MEMORY_UTILIZATION
+              value: {{ $.Values.model.gpuMemoryUtilization | quote }}
+            - name: PRISM_ENFORCE_EAGER
+              value: {{ $.Values.model.enforceEager | quote }}
             - name: PRISM_INSTANCE_ID
               value: {{ $member.name | quote }}
             - name: PRISM_ENGINE_ROLE

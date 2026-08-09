@@ -330,6 +330,60 @@ async def _bootstrap_replacement_owner(
     )
 
 
+def _validate_operator_harness_config(config: dict[str, object]) -> bool:
+    """Validate operator harness combinations and tokenizer requirements."""
+    correctness = bool(config["correctness_harness_enabled"])
+    performance = bool(config["performance_harness_enabled"])
+    route_parity = bool(config["route_parity_harness_enabled"])
+    enabled = correctness or performance or route_parity
+    if correctness and performance:
+        raise RuntimeError("correctness fault and performance harnesses are isolated")
+    if not enabled:
+        return False
+    if len(str(config["correctness_harness_secret"])) < 32:
+        raise RuntimeError(
+            "operator harness requires a Secret-backed token of at least 32 characters"
+        )
+    if not config["multinode_e2e_enabled"]:
+        raise RuntimeError("operator harness requires multinode_e2e")
+    affinity_off_performance = performance and route_parity and not correctness
+    if not config["affinity_enabled"] and not affinity_off_performance:
+        raise RuntimeError(
+            "operator harness requires affinity unless performance cold-only mode is active"
+        )
+    if performance and not route_parity:
+        raise RuntimeError("performance harness requires route parity harness")
+    return True
+
+
+def _install_pinned_tokenizer(app: FastAPI, config: dict[str, object]) -> object:
+    """Install the model-profile tokenizer independently of affinity routing."""
+    tokenizer_adapter = getattr(app.state, "tokenizer_adapter", None)
+    if tokenizer_adapter is None and config["tokenizer_model"]:
+        from transformers import AutoTokenizer
+        from prism_serve.router.tokenizer import TokenizerAdapter, TokenizerIdentity
+
+        encoder = AutoTokenizer.from_pretrained(
+            config["tokenizer_model"],
+            revision=config["tokenizer_revision"],
+            use_fast=True,
+        )
+        tokenizer_adapter = TokenizerAdapter(encoder, TokenizerIdentity(
+            model_id=config["tokenizer_model"],
+            tokenizer_revision=config["tokenizer_revision"],
+            chat_template_version=config["chat_template_version"],
+            block_size=config["prefix_block_size"],
+            hash_version="xxh64-chain-v1",
+            kv_compatibility_id=config["kv_compatibility_id"],
+        ))
+    if tokenizer_adapter is None or not hasattr(
+        tokenizer_adapter, "fingerprint_request"
+    ) or not hasattr(tokenizer_adapter, "encoder"):
+        raise RuntimeError("operator harness requires a process-local TokenizerAdapter")
+    app.state.tokenizer_adapter = tokenizer_adapter
+    return tokenizer_adapter
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Open readiness after dependencies start and reverse that order on exit."""
@@ -352,15 +406,15 @@ async def lifespan(app: FastAPI):
     app.state.topology_acceptance_task = None
     app.state.reconciler_replacement_task = None
     app.state.resource_refresh_task = None
+    app.state.performance_trace_registry = None
+    operator_harness_enabled = _validate_operator_harness_config(config)
+    if config["performance_harness_enabled"]:
+        from prism_serve.gateway.performance_harness import PerformanceTraceRegistry
+
+        app.state.performance_trace_registry = PerformanceTraceRegistry(
+            config["performance_trace_cap"]
+        )
     if config["correctness_harness_enabled"]:
-        if len(config["correctness_harness_secret"]) < 32:
-            raise RuntimeError(
-                "correctness harness requires a Secret-backed token of at least 32 characters"
-            )
-        if not config["multinode_e2e_enabled"] or not config["affinity_enabled"]:
-            raise RuntimeError(
-                "correctness harness requires multinode_e2e and affinity"
-            )
         from prism_serve.gateway.correctness_harness import FaultInjectionGate
 
         app.state.correctness_fault_gate = FaultInjectionGate(
@@ -496,6 +550,7 @@ async def lifespan(app: FastAPI):
             block_bytes=config["prefix_block_bytes"],
             active_operation_cap=config["active_operation_cap"],
             terminal_snapshot_cap=config["terminal_snapshot_cap"],
+            gateway_clock_epoch=config["scheduler_generation"],
             metrics=app.state.metrics,
         )
         network_control.set_correctness_fault_gate(
@@ -553,6 +608,9 @@ async def lifespan(app: FastAPI):
         app.state.metrics.set_scheduler(app.state.scheduler)
     affinity_coordinator = None
     reconciler_task = None
+    tokenizer_adapter = None
+    if config["affinity_enabled"] or operator_harness_enabled:
+        tokenizer_adapter = _install_pinned_tokenizer(app, config)
     prefix_poll_interval_s = (
         _prefix_poll_interval_s(config)
         if config["affinity_enabled"]
@@ -577,29 +635,7 @@ async def lifespan(app: FastAPI):
             raise RuntimeError(f"affinity RPC client missing capabilities: {missing}")
         if config["prefix_block_bytes"] <= 0:
             raise RuntimeError("affinity requires PRISM_SERVE_PREFIX_BLOCK_BYTES > 0")
-        tokenizer_adapter = getattr(app.state, "tokenizer_adapter", None)
-        if tokenizer_adapter is None and config["tokenizer_model"]:
-            from transformers import AutoTokenizer
-            from prism_serve.router.tokenizer import TokenizerAdapter, TokenizerIdentity
-
-            encoder = AutoTokenizer.from_pretrained(
-                config["tokenizer_model"],
-                revision=config["tokenizer_revision"],
-                use_fast=True,
-            )
-            tokenizer_adapter = TokenizerAdapter(encoder, TokenizerIdentity(
-                model_id=config["tokenizer_model"],
-                tokenizer_revision=config["tokenizer_revision"],
-                chat_template_version=config["chat_template_version"],
-                block_size=config["prefix_block_size"],
-                hash_version="xxh64-chain-v1",
-                kv_compatibility_id=config["kv_compatibility_id"],
-            ))
-        if tokenizer_adapter is None or not hasattr(
-            tokenizer_adapter, "fingerprint_request"
-        ):
-            raise RuntimeError("affinity requires a process-local TokenizerAdapter")
-        app.state.tokenizer_adapter = tokenizer_adapter
+        assert tokenizer_adapter is not None
         app.state.prefix_index = PrefixIndex(config["prefix_location_max_age_s"])
         topology = getattr(app.state, "topology_matrix", None) or TopologyMatrix()
         router = AffinityRouter(
@@ -813,11 +849,41 @@ def _request_config(request: Request) -> dict:
 
 
 def _correctness_auth_error(request: Request) -> JSONResponse | None:
+    return _operator_auth_error(
+        request, enabled_key="correctness_harness_enabled"
+    )
+
+
+def _route_parity_auth_error(request: Request) -> JSONResponse | None:
+    config = _request_config(request)
+    return _operator_auth_error(
+        request,
+        enabled=(
+            bool(config.get("correctness_harness_enabled"))
+            or bool(config.get("route_parity_harness_enabled"))
+        ),
+    )
+
+
+def _performance_auth_error(request: Request) -> JSONResponse | None:
+    return _operator_auth_error(
+        request, enabled_key="performance_harness_enabled"
+    )
+
+
+def _operator_auth_error(
+    request: Request,
+    *,
+    enabled_key: str | None = None,
+    enabled: bool | None = None,
+) -> JSONResponse | None:
     from prism_serve.gateway.correctness_harness import AUTH_HEADER, authorize
 
     config = _request_config(request)
     decision = authorize(
-        enabled=bool(config.get("correctness_harness_enabled")),
+        enabled=(
+            bool(config.get(enabled_key)) if enabled is None and enabled_key else bool(enabled)
+        ),
         configured_secret=str(config.get("correctness_harness_secret") or ""),
         supplied_secret=str(request.headers.get(AUTH_HEADER) or ""),
     )
@@ -847,17 +913,25 @@ async def chat_completions(request: Request):
     try:
         body = await request.json()
         model = str(body["model"])
+        config = _request_config(request)
+        runtime_model = str(config.get("model_id") or settings.model_id)
+        if model != runtime_model:
+            raise ValueError("model does not match runtime")
         correctness_route = None
+        performance_request = None
+        if "week12_correctness" in body and "prism_performance" in body:
+            raise ValueError("correctness and performance envelopes are isolated")
         if "week12_correctness" in body:
-            error = _correctness_auth_error(request)
+            error = _route_parity_auth_error(request)
             if error is not None:
                 return error
             from prism_serve.gateway.correctness_harness import parse_route
 
             correctness_route = parse_route(body["week12_correctness"])
-            config = _request_config(request)
-            if model != config["model_id"]:
-                raise ValueError("correctness model does not match runtime")
+            if config.get("performance_harness_enabled") \
+                    and not config.get("affinity_enabled") \
+                    and correctness_route.path != "cold":
+                return JSONResponse({"error": "not_found"}, status_code=404)
             tokenizer = getattr(request.app.state, "tokenizer_adapter", None)
             if tokenizer is None:
                 raise ValueError("correctness checks require the frozen tokenizer")
@@ -866,6 +940,31 @@ async def chat_completions(request: Request):
                 type(token) is int and 0 <= token < 2**64 for token in token_ids
             ):
                 raise ValueError("input_token_ids must be unsigned 64-bit integers")
+            from prism_serve.router.fingerprint import PromptFingerprint
+
+            fingerprint = PromptFingerprint.create(
+                namespace=tokenizer.namespace,
+                kv_compatibility_id=tokenizer.identity.kv_compatibility_id,
+                request_context_digest="text-only",
+                token_ids=token_ids,
+                block_size=tokenizer.identity.block_size,
+            )
+        elif "prism_performance" in body:
+            error = _performance_auth_error(request)
+            if error is not None:
+                return error
+            tokenizer = getattr(request.app.state, "tokenizer_adapter", None)
+            if tokenizer is None:
+                raise ValueError("performance harness requires the pinned tokenizer")
+            from prism_serve.gateway.performance_harness import parse_performance_request
+
+            performance_request = parse_performance_request(
+                body,
+                encoder=tokenizer.encoder,
+                runtime_model=runtime_model,
+                model_profile=dict(config.get("expected_model_profile") or {}),
+            )
+            token_ids = list(performance_request.input_token_ids)
             from prism_serve.router.fingerprint import PromptFingerprint
 
             fingerprint = PromptFingerprint.create(
@@ -903,6 +1002,7 @@ async def chat_completions(request: Request):
     sampling = {
         "temperature": float(body.get("temperature", 0.0)),
         "max_tokens": int(body.get("max_tokens", 32)),
+        "ignore_eos": body.get("ignore_eos") is True,
     }
     if correctness_route is not None:
         if body.get("stream", False):
@@ -910,7 +1010,6 @@ async def chat_completions(request: Request):
                 {"error": "invalid_request", "detail": "correctness harness is non-streaming"},
                 status_code=422,
             )
-        sampling["ignore_eos"] = body.get("ignore_eos") is True
         from prism_serve.gateway.correctness_harness import validate_fixture
 
         try:
@@ -930,6 +1029,39 @@ async def chat_completions(request: Request):
         try:
             control.require_correctness_evidence(req_id)
         except RuntimeError as exc:
+            return JSONResponse(
+                {"error": "service_unavailable", "detail": str(exc)}, status_code=503
+            )
+    performance_registry = None
+    performance_control = None
+    if performance_request is not None:
+        performance_registry = getattr(
+            request.app.state, "performance_trace_registry", None
+        )
+        performance_control = getattr(request.app.state, "network_control", None)
+        if performance_registry is None or performance_control is None \
+                or not hasattr(performance_control, "require_request_evidence"):
+            return JSONResponse(
+                {"error": "service_unavailable", "detail": "performance control unavailable"},
+                status_code=503,
+            )
+        from prism_serve.gateway.performance_harness import (
+            PerformanceTraceCapacity,
+            PerformanceTraceConflict,
+        )
+
+        try:
+            performance_registry.reserve(
+                performance_request,
+                world_identity=_performance_world_identity(request.app),
+            )
+            performance_control.require_request_evidence(req_id)
+        except PerformanceTraceConflict as exc:
+            return JSONResponse(
+                {"error": "conflict", "detail": str(exc)}, status_code=409
+            )
+        except (PerformanceTraceCapacity, RuntimeError) as exc:
+            performance_registry.rollback_uncommitted(req_id)
             return JSONResponse(
                 {"error": "service_unavailable", "detail": str(exc)}, status_code=503
             )
@@ -954,6 +1086,9 @@ async def chat_completions(request: Request):
     except AssertionError as exc:
         if correctness_route is not None:
             control.cancel_correctness_evidence(req_id)
+        if performance_registry is not None:
+            performance_registry.rollback_uncommitted(req_id)
+            performance_control.cancel_request_evidence(req_id)
         return JSONResponse({"error": "conflict", "detail": str(exc)}, status_code=409)
     from prism_serve.gateway.output import GatewayOutputCapacity
     try:
@@ -962,6 +1097,9 @@ async def chat_completions(request: Request):
         tracker.remove(req_id)
         if correctness_route is not None:
             control.cancel_correctness_evidence(req_id)
+        if performance_registry is not None:
+            performance_registry.rollback_uncommitted(req_id)
+            performance_control.cancel_request_evidence(req_id)
         return JSONResponse(
             {"error": "service_unavailable", "detail": str(exc)},
             status_code=503,
@@ -1012,23 +1150,40 @@ async def chat_completions(request: Request):
 
     async def stream_events():
         cursor = 0
-        while True:
-            tokens, terminal, error = await wait_with_query(cursor)
-            for token in tokens:
-                cursor += 1
-                event = {
-                    "id": req_id, "object": "chat.completion.chunk", "model": model,
-                    "choices": [{"index": 0, "delta": {"token_id": token}, "finish_reason": None}],
-                }
-                yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
-            if error or terminal:
-                final = {
-                    "id": req_id, "object": "chat.completion.chunk", "model": model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "error" if error else "stop"}],
-                }
-                yield f"data: {json.dumps(final, separators=(',', ':'))}\n\n"
-                yield "data: [DONE]\n\n"
-                return
+        try:
+            while True:
+                tokens, terminal, error = await wait_with_query(cursor)
+                for token in tokens:
+                    cursor += 1
+                    event = {
+                        "id": req_id, "object": "chat.completion.chunk", "model": model,
+                        "choices": [{"index": 0, "delta": {"token_id": token}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
+                if error or terminal:
+                    if performance_registry is not None:
+                        performance_registry.observe_stream_terminal(req_id)
+                    final = {
+                        "id": req_id, "object": "chat.completion.chunk", "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "error" if error else "stop"}],
+                    }
+                    yield f"data: {json.dumps(final, separators=(',', ':'))}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+        except asyncio.CancelledError:
+            if performance_registry is not None:
+                performance_registry.mark_detached(req_id)
+            raise
+        except GeneratorExit:
+            if performance_registry is not None:
+                performance_registry.mark_detached(req_id)
+            raise
+        except Exception as exc:
+            if performance_registry is not None:
+                performance_registry.mark_stream_error(
+                    req_id, f"{type(exc).__name__}: {exc}"
+                )
+            raise
 
     if body.get("stream", False):
         return StreamingResponse(stream_events(), media_type="text/event-stream")
@@ -1049,6 +1204,49 @@ async def chat_completions(request: Request):
         "choices": [{"index": 0, "message": {"role": "assistant", "token_ids": tokens},
                      "finish_reason": "error" if error else "stop"}],
     })
+
+
+def _performance_world_identity(app: FastAPI) -> dict[str, object]:
+    """Return the current 2P2D identity for manifest comparison."""
+    registry = getattr(app.state, "worker_registry", None)
+    control = getattr(app.state, "network_control", None)
+    config = getattr(app.state, "runtime_config", None)
+    if registry is None or control is None or not isinstance(config, dict) \
+            or not registry.world_fresh():
+        raise RuntimeError("performance world identity is not ready")
+    from prism_serve.router.worker_registry import EXPECTED_MEMBERS
+
+    members = registry.members
+    if set(members) != set(EXPECTED_MEMBERS):
+        raise RuntimeError("performance world does not contain exact 2P2D members")
+    topology_generation = registry.expected_topology_generation
+    gateway_pod_uid = config.get("scheduler_id")
+    gateway_clock_epoch = getattr(control, "gateway_clock_epoch", None)
+    if not isinstance(gateway_pod_uid, str) or not gateway_pod_uid \
+            or not isinstance(gateway_clock_epoch, str) or not gateway_clock_epoch \
+            or gateway_clock_epoch != config.get("scheduler_generation"):
+        raise RuntimeError("performance Gateway identity is incomplete")
+    workers: dict[str, dict[str, object]] = {}
+    for instance_id, (role, global_rank) in EXPECTED_MEMBERS.items():
+        identity = members[instance_id]
+        if identity.instance_id != instance_id or identity.role != role \
+                or identity.global_rank != global_rank \
+                or identity.topology_generation != topology_generation:
+            raise RuntimeError(f"performance worker identity drifted: {instance_id}")
+        workers[instance_id] = {
+            "pod_uid": identity.pod_uid,
+            "instance_epoch": identity.instance_epoch,
+            "global_rank": identity.global_rank,
+        }
+    return {
+        "gateway": {
+            "pod_uid": gateway_pod_uid,
+            "clock_epoch": gateway_clock_epoch,
+        },
+        "topology_generation": topology_generation,
+        "affinity_enabled": bool(config.get("affinity_enabled")),
+        "workers": workers,
+    }
 
 
 async def _correctness_resource_snapshot(app: FastAPI) -> dict[str, object]:
@@ -1182,6 +1380,33 @@ async def correctness_resources(request: Request):
             {"error": "resource_authority_unavailable", "detail": str(exc)},
             status_code=503,
         )
+
+
+@app.get("/internal/week12/performance/resources")
+async def performance_resources(request: Request):
+    error = _performance_auth_error(request)
+    if error is not None:
+        return error
+    traces = getattr(request.app.state, "performance_trace_registry", None)
+    if traces is None:
+        return JSONResponse({"error": "not_ready"}, status_code=503)
+    try:
+        snapshot = await _correctness_resource_snapshot(request.app)
+        world_identity = _performance_world_identity(request.app)
+        profile = _request_config(request).get("expected_model_profile")
+        if not isinstance(profile, dict) or not profile:
+            raise RuntimeError("performance model profile is not ready")
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        return JSONResponse(
+            {"error": "resource_authority_unavailable", "detail": str(exc)},
+            status_code=503,
+        )
+    return {
+        **snapshot,
+        "world_identity": world_identity,
+        "model_profile": dict(profile),
+        "trace_counts": traces.counts(),
+    }
 
 
 @app.post("/internal/week12/correctness/faults")
@@ -1323,39 +1548,45 @@ async def correctness_replacement_evidence(
     }
 
 
-@app.get("/internal/week12/correctness/requests/{req_id}")
-async def correctness_request_evidence(request: Request, req_id: str):
-    error = _correctness_auth_error(request)
-    if error is not None:
-        return error
-    control = getattr(request.app.state, "network_control", None)
-    registry = getattr(request.app.state, "worker_registry", None)
+def _render_request_route_evidence(
+    app: FastAPI, req_id: str, *, require_transfer_timing: bool = False
+) -> dict[str, object]:
+    control = getattr(app.state, "network_control", None)
+    registry = getattr(app.state, "worker_registry", None)
     if control is None or registry is None:
-        return JSONResponse({"error": "not_ready"}, status_code=503)
+        raise RuntimeError("route evidence control is not ready")
     observed = control.request_evidence(req_id)
     if observed is None:
-        return JSONResponse({"error": "evidence_not_found"}, status_code=404)
+        raise KeyError(req_id)
     route = observed.get("route")
     src_blocks = observed.get("src_block_ids")
     dst_blocks = observed.get("dst_block_ids")
     if not isinstance(route, dict) or not isinstance(src_blocks, list) \
             or not isinstance(dst_blocks, list) or len(src_blocks) != len(dst_blocks):
-        return JSONResponse({"error": "evidence_incomplete"}, status_code=503)
+        raise RuntimeError("route evidence is incomplete")
     source = str(route.get("source"))
     target = str(route.get("target"))
     mapping = []
     transport: dict[str, object]
     if source == target:
         if src_blocks or dst_blocks or int(observed.get("completed_bytes", -1)) != 0:
-            return JSONResponse({"error": "local_evidence_contradiction"}, status_code=503)
-        transport = {"selected_mode": "NO_TRANSFER", "completed_bytes": 0}
+            raise RuntimeError("local route evidence is contradictory")
+        transport = {
+            "selected_mode": "NO_TRANSFER",
+            "completed_bytes": 0,
+            "work_terminal": observed.get("work_terminal") is True,
+            "cuda_terminal": observed.get("cuda_terminal") is True,
+            "gateway_clock_epoch": observed.get("gateway_clock_epoch"),
+            "transfer_started_ns": observed.get("transfer_started_ns"),
+            "transfer_terminal_ns": observed.get("transfer_terminal_ns"),
+        }
     else:
         capability = next((
             value for value in registry.capabilities.values()
             if set(value.pair_id.split("--")) == {source, target}
         ), None)
         if capability is None:
-            return JSONResponse({"error": "pair_capability_missing"}, status_code=503)
+            raise RuntimeError("route pair capability is missing")
         pair_members = capability.pair_id.split("--")
         members = registry.members
         mapping = [
@@ -1380,8 +1611,91 @@ async def correctness_request_evidence(request: Request, req_id: str):
             "completed_bytes": int(observed.get("completed_bytes", 0)),
             "work_terminal": observed.get("work_terminal") is True,
             "cuda_terminal": observed.get("cuda_terminal") is True,
+            "gateway_clock_epoch": observed.get("gateway_clock_epoch"),
+            "transfer_started_ns": observed.get("transfer_started_ns"),
+            "transfer_terminal_ns": observed.get("transfer_terminal_ns"),
         }
+        if require_transfer_timing and (
+            not isinstance(transport["gateway_clock_epoch"], str)
+            or not transport["gateway_clock_epoch"]
+            or type(transport["transfer_started_ns"]) is not int
+            or type(transport["transfer_terminal_ns"]) is not int
+            or transport["transfer_terminal_ns"] <= transport["transfer_started_ns"]
+        ):
+            raise RuntimeError("Gateway transfer timing evidence is incomplete")
+    if not transport["work_terminal"] or not transport["cuda_terminal"]:
+        raise RuntimeError("route resource terminal evidence is incomplete")
     return {**observed, "mapping": mapping, "transport": transport}
+
+
+@app.get("/internal/week12/correctness/requests/{req_id}")
+async def correctness_request_evidence(request: Request, req_id: str):
+    error = _route_parity_auth_error(request)
+    if error is not None:
+        return error
+    try:
+        return _render_request_route_evidence(request.app, req_id)
+    except KeyError:
+        return JSONResponse({"error": "evidence_not_found"}, status_code=404)
+    except RuntimeError as exc:
+        return JSONResponse(
+            {"error": "evidence_incomplete", "detail": str(exc)}, status_code=503
+        )
+
+
+@app.get("/internal/week12/performance/requests/{req_id}")
+async def performance_request_evidence(request: Request, req_id: str):
+    error = _performance_auth_error(request)
+    if error is not None:
+        return error
+    traces = getattr(request.app.state, "performance_trace_registry", None)
+    tracker = getattr(request.app.state, "tracker", None)
+    output = getattr(request.app.state, "output_buffer", None)
+    if traces is None or tracker is None or output is None:
+        return JSONResponse({"error": "not_ready"}, status_code=503)
+    state = traces.state(req_id)
+    if state == "unknown":
+        return JSONResponse({"error": "evidence_not_found"}, status_code=404)
+    if state == "tombstone":
+        return JSONResponse({"error": "evidence_acknowledged"}, status_code=410)
+    if state == "terminal":
+        return traces.terminal_trace(req_id)
+    token_ids, terminal, runtime_error = output.snapshot(req_id)
+    if (not terminal and runtime_error is None) or tracker.get(req_id) is not None:
+        return JSONResponse(
+            {"status": "active", "request_id": req_id, "trace_counts": traces.counts()},
+            status_code=202,
+        )
+    try:
+        route = _render_request_route_evidence(
+            request.app, req_id, require_transfer_timing=True
+        )
+        return traces.finalize(
+            req_id,
+            output_token_ids=token_ids,
+            runtime_error=runtime_error,
+            route_evidence=route,
+        )
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        return JSONResponse(
+            {"error": "evidence_incomplete", "detail": str(exc)}, status_code=503
+        )
+
+
+@app.delete("/internal/week12/performance/requests/{req_id}")
+async def acknowledge_performance_request_evidence(request: Request, req_id: str):
+    error = _performance_auth_error(request)
+    if error is not None:
+        return error
+    traces = getattr(request.app.state, "performance_trace_registry", None)
+    if traces is None:
+        return JSONResponse({"error": "not_ready"}, status_code=503)
+    state = traces.acknowledge(req_id)
+    if state == "active":
+        return JSONResponse({"error": "request_active"}, status_code=409)
+    if state == "unknown":
+        return JSONResponse({"error": "evidence_not_found"}, status_code=404)
+    return Response(status_code=204)
 
 
 @app.post("/internal/register_instance")
@@ -3115,6 +3429,11 @@ def _finalize_topology_acceptance(app: FastAPI, generation: str) -> None:
 
 
 def _build_config() -> dict:
+    terminal_snapshot_cap = settings.terminal_snapshot_cap
+    if settings.performance_harness_enabled:
+        terminal_snapshot_cap = max(
+            terminal_snapshot_cap, settings.performance_trace_cap
+        )
     expected_model_profile = None
     if settings.multinode_e2e_enabled:
         expected_model_profile = {
@@ -3134,6 +3453,11 @@ def _build_config() -> dict:
             "head_dim": settings.model_head_dim,
             "rope_theta": settings.model_rope_theta,
             "kv_compatibility_id": settings.kv_compatibility_id,
+            "max_model_len": settings.max_model_len,
+            "max_num_batched_tokens": settings.max_num_batched_tokens,
+            "max_num_seqs": settings.max_num_seqs,
+            "gpu_memory_utilization": settings.gpu_memory_utilization,
+            "enforce_eager": settings.enforce_eager,
         }
     return {
         "nats_url":                 settings.nats_url,
@@ -3150,7 +3474,7 @@ def _build_config() -> dict:
         "operation_query_interval_ms": settings.operation_query_interval_ms,
         "active_operation_cap":       settings.active_operation_cap,
         "operation_reorder_window":   settings.operation_reorder_window,
-        "terminal_snapshot_cap":      settings.terminal_snapshot_cap,
+        "terminal_snapshot_cap":      terminal_snapshot_cap,
         "replacement_store_path":    settings.replacement_store_path,
         "replacement_store_max_records_per_run": (
             settings.replacement_store_max_records_per_run
@@ -3159,6 +3483,9 @@ def _build_config() -> dict:
             settings.replacement_store_seal_retention
         ),
         "correctness_harness_enabled": settings.correctness_harness_enabled,
+        "performance_harness_enabled": settings.performance_harness_enabled,
+        "route_parity_harness_enabled": settings.route_parity_harness_enabled,
+        "performance_trace_cap": settings.performance_trace_cap,
         "correctness_harness_secret": settings.correctness_harness_secret,
         "correctness_fault_gate_timeout_s": (
             settings.correctness_fault_gate_timeout_s
@@ -3174,6 +3501,11 @@ def _build_config() -> dict:
         "runtime_dtype":              settings.runtime_dtype,
         "tensor_parallel_size":       settings.tensor_parallel_size,
         "kv_block_bytes":             settings.kv_block_bytes,
+        "max_model_len":              settings.max_model_len,
+        "max_num_batched_tokens":     settings.max_num_batched_tokens,
+        "max_num_seqs":               settings.max_num_seqs,
+        "gpu_memory_utilization":      settings.gpu_memory_utilization,
+        "enforce_eager":               settings.enforce_eager,
         "expected_model_profile":      expected_model_profile,
         "tokenizer_model":             settings.tokenizer_model,
         "tokenizer_revision":          settings.tokenizer_revision,

@@ -1186,7 +1186,9 @@ async def test_chat_wait_does_not_query_output_before_request_commit(monkeypatch
         app.state, "queue", SimpleNamespace(is_connected=True), raising=False
     )
     monkeypatch.setattr(app.state, "worker_registry", None, raising=False)
-    monkeypatch.setattr(app.state, "runtime_config", {}, raising=False)
+    monkeypatch.setattr(
+        app.state, "runtime_config", {"model_id": "test"}, raising=False
+    )
     monkeypatch.setattr(app.state, "tokenizer_adapter", None, raising=False)
     monkeypatch.setattr(app.state, "tracker", tracker, raising=False)
     monkeypatch.setattr(
@@ -1251,7 +1253,9 @@ async def test_chat_wait_terminates_when_canonical_request_was_removed(monkeypat
         app.state, "queue", SimpleNamespace(is_connected=True), raising=False
     )
     monkeypatch.setattr(app.state, "worker_registry", None, raising=False)
-    monkeypatch.setattr(app.state, "runtime_config", {}, raising=False)
+    monkeypatch.setattr(
+        app.state, "runtime_config", {"model_id": "test"}, raising=False
+    )
     monkeypatch.setattr(app.state, "tokenizer_adapter", None, raising=False)
     monkeypatch.setattr(app.state, "tracker", tracker, raising=False)
     monkeypatch.setattr(app.state, "output_buffer", output, raising=False)
@@ -1295,7 +1299,7 @@ def test_chat_capacity_failure_rolls_back_tracker_admission():
         app.state.output_buffer = bounded
         try:
             response = client.post("/v1/chat/completions", json={
-                "request_id": "blocked", "model": "test",
+                "request_id": "blocked", "model": gateway_module.settings.model_id,
                 "input_token_ids": [1],
                 "messages": [{"role": "user", "content": "x"}],
             })
