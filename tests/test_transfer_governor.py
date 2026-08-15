@@ -170,6 +170,22 @@ def test_submit_deferred_when_congested():
     assert len(gov._deferred["d-0"]) == 1
 
 
+def test_submit_deferred_uses_declared_metric_labels():
+    gov, _, metrics = make_governor()
+    _set_usage(gov, 0.90)
+
+    def enforce_deferred_labels(name, value, *, labels=None):
+        if name == "deferred_queue_depth":
+            assert labels == {"dst": "d-0"}
+
+    metrics.gauge.side_effect = enforce_deferred_labels
+    gov.submit(_task("R1", "d-0", 112 * 1024 ** 2))
+
+    metrics.gauge.assert_called_once_with(
+        "deferred_queue_depth", 1, labels={"dst": "d-0"}
+    )
+
+
 def test_on_complete_releases_inflight():
     gov, infer_client, _ = make_governor()
     _set_usage(gov, 0.50)

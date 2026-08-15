@@ -146,7 +146,6 @@ class TransferGovernor:
 
     def submit(self, task: TransferTask) -> None:
         dst = task.dst
-        pair_id = self._pair_id(task.src, task.dst)
         if self.can_send(dst, task.kv_size, task.priority, src=task.src):
             self._dispatch(task)
         else:
@@ -154,7 +153,7 @@ class TransferGovernor:
             self.metrics.gauge(
                 "deferred_queue_depth",
                 len(self._deferred[dst]),
-                labels={"dst": dst, "pair": pair_id},
+                labels={"dst": dst},
             )
 
     def _dispatch(self, task: TransferTask) -> None:
