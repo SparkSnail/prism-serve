@@ -6,6 +6,7 @@
 
 <p align="center">
   <a href="#features"><b>Features</b></a> &middot;
+  <a href="#performance-snapshot"><b>Performance</b></a> &middot;
   <a href="#installation"><b>Installation</b></a> &middot;
   <a href="#quick-start"><b>Quick Start</b></a> &middot;
   <a href="#testing"><b>Testing</b></a> &middot;
@@ -24,7 +25,7 @@ recompute fallback, and a 10 ms reconcile loop modelled on Ray Serve.
 
 > [!WARNING]
 > This is an experimental fixed 2P2D snapshot, not a production-ready release, and it
-> does not claim complete E2E success. The latest frozen two-node/four-GPU campaign ran
+> does not claim complete E2E success. A separate frozen correctness campaign ran
 > 31/35 cases passed (31 passed, 3 failed, and 1 was blocked); 4/5 evidence packets passed;
 > final-clean failed. Known limitations are a decode-worker SIGSEGV during gateway
 > restart cleanup and tunnel recovery failure while the local forwarding port remained bound.
@@ -39,6 +40,40 @@ recompute fallback, and a 10 ms reconcile loop modelled on Ray Serve.
 - [x] **10 ms schedule loop**: Phase 1-6 reconcile - assign P/D, submit KV, stuck check, deferred flush, collect finished, metrics
 - [x] **NATS queue**: publish/subscribe wrapper, bounded inbox, queue-group load balancing, wildcard `kv_usage.*` subscription
 - [x] **Metrics**: Prometheus counters/gauges/histograms for TTFT, KV transfer, congestion, deferred depth, slot utilisation
+
+## Performance Snapshot
+
+A frozen absolute-baseline run on 2026-08-18 passed the canonical performance
+validator (`headline_valid=true`) and its final resource-clean proof. These numbers
+cover only affinity disabled (`PERF_OFF`). The affinity-enabled `PERF_ON` comparison
+is `NOT_RUN`; no optimization gain is claimed.
+
+| Run setup | Value |
+|---|---|
+| Environment | Alibaba Cloud ACK, 2 nodes, 4 x NVIDIA L20 GPUs |
+| Model / topology | Qwen3-8B, BF16, TP=1, fixed 2P2D |
+| Routing / transport | Affinity disabled; `NCCL_SOCKET` on 1,050/1,050 request traces |
+| Load shape | Concurrency 50; 769 input tokens; 32 output tokens |
+| Samples | 300/300 warm-up requests passed; 750/750 measured requests passed across 3 repetitions |
+
+| Latency | p50 (ms) | p95 (ms) | p99 (ms) |
+|---|---:|---:|---:|
+| TTFT | 6,921.109 | 9,615.555 | 10,908.582 |
+| TPOT | 27.199 | 29.338 | 31.013 |
+| Inter-chunk | 22.795 | 84.418 | 139.210 |
+| End-to-end | 7,790.814 | 10,505.132 | 11,755.448 |
+
+| Throughput / GPU telemetry | Result |
+|---|---:|
+| Successful requests/s | 6.005 |
+| Successful output tokens/s | 192.152 |
+| GPU utilization, mean / p95 | 54.664% / 92.000% |
+| GPU memory, mean / p95 | 39,931 / 40,008 MiB |
+| GPU power, mean / p95 | 165.540 / 225.330 W |
+| GPU SM clock, mean / p95 | 2,520 / 2,520 MHz |
+
+Evidence identity: run `20260818T135933Z`; final performance-packet SHA-256
+`5951db093ca55124632c0ddd4f197b46534ea9e43cf0b094eb7d2cf43cd35836`.
 
 ## Installation
 
