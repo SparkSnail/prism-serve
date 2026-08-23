@@ -1721,6 +1721,31 @@ async def test_normal_cleanup_remote_acks_then_releases_slot_last():
 
 
 @pytest.mark.asyncio
+async def test_normal_cleanup_waits_for_active_network_task_before_finalizing():
+    client = NormalCleanupClient()
+    rpc, scheduler, req = _normal_cleanup_rpc(client)
+    active_task = asyncio.create_task(asyncio.Event().wait())
+    rpc._normal_tasks["r1"] = active_task
+
+    try:
+        assert await rpc.cleanup_request(scheduler, req, abort=True) is False
+        assert client.finalize_calls == []
+        assert scheduler.decode_slot_lease("r1").state == "QUARANTINED"
+
+        active_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await active_task
+
+        assert await rpc.cleanup_request(scheduler, req, abort=True) is True
+        assert scheduler.decode_slot_lease("r1").state == "RELEASED"
+    finally:
+        if not active_task.done():
+            active_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await active_task
+
+
+@pytest.mark.asyncio
 async def test_normal_cleanup_unknown_sends_zero_finalize_and_holds_slot():
     client = NormalCleanupClient(fail_query=True)
     rpc, scheduler, req = _normal_cleanup_rpc(client)

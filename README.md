@@ -75,6 +75,20 @@ is `NOT_RUN`; no optimization gain is claimed.
 Evidence identity: run `20260818T135933Z`; final performance-packet SHA-256
 `5951db093ca55124632c0ddd4f197b46534ea9e43cf0b094eb7d2cf43cd35836`.
 
+### Supplemental `PERF_ON` cell evidence
+
+Collected on 2026-08-22 with the same ACK/Qwen3-8B BF16 fixed 2P2D setup.
+These cell-level results have zero failed requests and `headline_valid=true`,
+but remain separate from the canonical `PERF_OFF` packet:
+
+| Cell | Warmup / measured | TTFT p50 / p95 / p99 (ms) | TPOT p50 (ms) | Output tok/s |
+|---|---:|---:|---:|---:|
+| `balanced-1024x128-c100` | 600 / 1,500 | 17,157.092 / 24,832.803 / 29,436.452 | 30.011 | 582.598 |
+| `prefill-2048x32-c50` | 300 / 750 | 13,706.317 / 20,176.845 / 23,585.095 | 30.099 | 108.156 |
+| `decode-128x256-c50` | 300 / 750 | 2,569.163 / 5,107.496 / 6,417.857 | 36.844 | 883.593 |
+
+`unified_comparison=NOT_RUN`; no optimization gain is claimed.
+
 ## Installation
 
 Requires Python 3.10+.

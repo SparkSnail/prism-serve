@@ -1404,6 +1404,9 @@ class NetworkControlRPC:
             return True
         if lease.state != "QUARANTINED":
             scheduler.quarantine_decode_slot(operation_id)
+        normal_task = self._normal_tasks.get(operation_id)
+        if normal_task is not None and not normal_task.done():
+            return False
 
         candidates: list[tuple[str, str, EndpointOperationRef]] = []
         if req.dispatch_operation_ref is not None:
