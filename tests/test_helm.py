@@ -122,7 +122,7 @@ def test_gateway_lifecycle_budgets_cover_bootstrap_and_shutdown() -> None:
 
     assert GATEWAY_BOOTSTRAP_TIMEOUT_S == 570.0
     assert GATEWAY_STARTUP_PROBE_MARGIN_S == 30.0
-    assert startup_budget_s == 600
+    assert startup_budget_s == 720
     assert startup_budget_s >= required_startup_s
     assert _manifest_int(
         gateway, "terminationGracePeriodSeconds"

@@ -39,7 +39,7 @@ gateway:
   startupProbe:
     periodSeconds: 10
     timeoutSeconds: 5
-    failureThreshold: 60
+    failureThreshold: 72
   # Gateway ledger generation changes only through /admin/topology/accept.
   topologyGeneration: "00000000-0000-4000-8000-000000000001"
   correctnessHarness:

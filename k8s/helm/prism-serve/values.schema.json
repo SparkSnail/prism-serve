@@ -19,7 +19,7 @@
           "properties": {
             "periodSeconds": {"const": 10},
             "timeoutSeconds": {"const": 5},
-            "failureThreshold": {"const": 60}
+            "failureThreshold": {"const": 72}
           },
           "additionalProperties": false
         },
