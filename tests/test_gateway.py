@@ -72,6 +72,56 @@ def test_readyz_not_ready_when_nats_disconnects():
     assert response.status_code == 503
 
 
+def test_readyz_not_ready_when_worker_rpc_refresh_failed():
+    from starlette.requests import Request
+
+    class LiveTask:
+        def done(self):
+            return False
+
+    fake_app = SimpleNamespace(state=SimpleNamespace(
+        accepting=True,
+        runtime_config={"multinode_e2e_enabled": True, "affinity_enabled": False},
+        worker_rpc_ready=False,
+        loop_task=LiveTask(),
+        queue=SimpleNamespace(is_connected=True),
+        worker_registry=SimpleNamespace(world_fresh=lambda: True),
+        resource_refresh_task=LiveTask(),
+        control_plane_failed=False,
+    ))
+    request = Request({"type": "http", "app": fake_app, "headers": []})
+
+    response = gateway_module.readyz(request)
+
+    assert response.status_code == 503
+    assert response.body == b'{"status":"not_ready"}'
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_rejects_failed_worker_rpc_refresh():
+    class LiveTask:
+        def done(self):
+            return False
+
+    fake_app = SimpleNamespace(state=SimpleNamespace(
+        accepting=True,
+        runtime_config={"multinode_e2e_enabled": True, "affinity_enabled": False},
+        worker_rpc_ready=False,
+        queue=SimpleNamespace(is_connected=True),
+        worker_registry=SimpleNamespace(world_fresh=lambda: True),
+        resource_refresh_task=LiveTask(),
+        control_plane_failed=False,
+    ))
+    from starlette.requests import Request
+
+    request = Request({"type": "http", "app": fake_app, "headers": []})
+
+    response = await gateway_module.chat_completions(request)
+
+    assert response.status_code == 503
+    assert response.body == b'{"error":"service_unavailable","detail":"gateway not ready"}'
+
+
 def test_week12_admission_requires_exact_published_prefix_world():
     from types import SimpleNamespace
 

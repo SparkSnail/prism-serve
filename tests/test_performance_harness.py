@@ -185,6 +185,22 @@ def test_trace_registry_records_short_output_disconnect_and_capacity() -> None:
         registry.reserve(parsed_request("short"), world_identity=world_identity())
 
 
+def test_trace_registry_rejects_complete_output_without_stream_terminal() -> None:
+    registry = PerformanceTraceRegistry()
+    registry.reserve(parsed_request("missing-terminal"), world_identity=world_identity())
+
+    evidence = registry.finalize(
+        "missing-terminal",
+        output_token_ids=[7, 8],
+        runtime_error=None,
+        route_evidence=local_route(),
+    )
+
+    assert evidence["status"] == "FAILED"
+    assert evidence["error_code"] == "STREAM_TERMINAL_NOT_OBSERVED"
+    assert evidence["stream"]["terminal_observed"] is False
+
+
 def test_performance_mode_retains_backing_snapshots_for_the_trace_cap(
     monkeypatch,
 ) -> None:

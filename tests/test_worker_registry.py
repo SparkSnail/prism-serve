@@ -396,6 +396,7 @@ async def test_refresh_transient_incomplete_evidence_ages_then_recovers(
     await _refresh_worker_world_once(app)
     before = app.state.worker_registry.resource_signal("d0")
     assert app.state.worker_registry.world_fresh() is True
+    assert app.state.worker_rpc_ready is True
 
     setattr(client, transient_field, "d0")
     now[0] = 1.0
@@ -406,6 +407,7 @@ async def test_refresh_transient_incomplete_evidence_ages_then_recovers(
     assert during.age_s == 1.0
     assert app.state.worker_registry.world_fresh() is True
     assert app.state.accepting is True
+    assert app.state.worker_rpc_ready is False
 
     now[0] = 2.000001
     await _refresh_worker_world_once(app)
@@ -417,6 +419,7 @@ async def test_refresh_transient_incomplete_evidence_ages_then_recovers(
     await _refresh_worker_world_once(app)
     assert app.state.worker_registry.world_fresh() is True
     assert app.state.accepting is True
+    assert app.state.worker_rpc_ready is True
 
 
 @pytest.mark.asyncio
@@ -470,6 +473,33 @@ async def test_refresh_transport_failure_ages_cached_report_before_fail_closed()
     await _refresh_worker_world_once(app)
     assert app.state.worker_registry.state == TopologyState.FAILED
     assert app.state.accepting is False
+
+
+@pytest.mark.asyncio
+async def test_refresh_transport_failure_closes_worker_rpc_readiness_immediately():
+    now = [0.0]
+    client = _RefreshClient()
+    app = _refresh_app(client)
+    app.state.runtime_config = {
+        "multinode_e2e_enabled": True,
+        "affinity_enabled": False,
+    }
+    app.state.worker_rpc_ready = True
+    app.state.worker_registry = _ready_registry(clock=lambda: now[0])
+
+    await _refresh_worker_world_once(app)
+    assert app.state.worker_rpc_ready is True
+
+    client.unreachable_instance = "d0"
+    now[0] = 1.0
+    await _refresh_worker_world_once(app)
+
+    assert app.state.worker_registry.world_fresh() is True
+    assert app.state.worker_rpc_ready is False
+
+    client.unreachable_instance = None
+    await _refresh_worker_world_once(app)
+    assert app.state.worker_rpc_ready is True
 
 
 @pytest.mark.asyncio

@@ -285,6 +285,10 @@ class PerformanceTraceRegistry:
         elif len(output_token_ids) != active.request.expected_output_tokens:
             status = "FAILED"
             error_code = "OUTPUT_TOKEN_COUNT_MISMATCH"
+        elif not active.stream_terminal_observed:
+            # A full token count does not prove the client saw a terminal frame.
+            status = "FAILED"
+            error_code = "STREAM_TERMINAL_NOT_OBSERVED"
 
         transport = route_evidence["transport"]
         route = {

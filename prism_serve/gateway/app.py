@@ -397,6 +397,8 @@ async def lifespan(app: FastAPI):
     config = _build_config()
     app.state.accepting = False
     app.state.runtime_config = config
+    # Single-node mode has no worker control plane to probe.
+    app.state.worker_rpc_ready = not bool(config["multinode_e2e_enabled"])
     app.state.control_plane_failed = False
     app.state.correctness_fault_gate = None
     app.state.owner_takeover_audit = None
@@ -455,6 +457,8 @@ async def lifespan(app: FastAPI):
             deadline=gateway_bootstrap_deadline,
             retry_interval_s=_bootstrap_retry_interval_s(config),
         )
+        # A complete bootstrap round supplies the initial control-RPC sample.
+        app.state.worker_rpc_ready = True
 
     # Start metrics before components that report through it.
     try:
@@ -825,11 +829,13 @@ def readyz(request: Request) -> JSONResponse:
     queue_healthy = queue is not None and queue.is_connected
     registry = getattr(request.app.state, "worker_registry", None)
     topology_healthy = registry is None or registry.world_fresh()
+    worker_rpc_healthy = _worker_rpc_allows_admission(request.app)
     prefix_healthy = _prefix_world_allows_admission(request.app)
     background_healthy = _background_control_plane_tasks_healthy(request.app)
     if (
         accepting and loop_healthy and queue_healthy
-        and topology_healthy and prefix_healthy and background_healthy
+        and topology_healthy and worker_rpc_healthy
+        and prefix_healthy and background_healthy
     ):
         return JSONResponse({"status": "ready"})
     return JSONResponse({"status": "not_ready"}, status_code=503)
@@ -903,6 +909,7 @@ async def chat_completions(request: Request):
         or queue is None
         or not queue.is_connected
         or (registry is not None and not registry.world_fresh())
+        or not _worker_rpc_allows_admission(request.app)
         or not _prefix_world_allows_admission(request.app)
         or not _background_control_plane_tasks_healthy(request.app)
     ):
@@ -3129,6 +3136,13 @@ async def _refresh_worker_world_once(app: FastAPI) -> None:
     if semantic_drift:
         app.state.accepting = False
 
+    # A cached fresh world cannot mask a failed control-RPC sweep.
+    app.state.worker_rpc_ready = bool(
+        refresh_complete
+        and not semantic_drift
+        and registry.world_fresh()
+    )
+
     app.state.accepting = (
         not semantic_drift
         and registry.world_fresh()
@@ -3227,6 +3241,17 @@ def _replacement_store_allows_admission(app: FastAPI) -> bool:
         store is None
         or (store.ready and store.transition_closed)
     )
+
+
+def _worker_rpc_allows_admission(app: FastAPI) -> bool:
+    """Require the latest multinode worker control-RPC sweep to have passed."""
+    config = getattr(app.state, "runtime_config", {})
+    if not (
+        isinstance(config, dict)
+        and config.get("multinode_e2e_enabled")
+    ):
+        return True
+    return getattr(app.state, "worker_rpc_ready", False) is True
 
 
 def _topology_acceptance_allows_admission(app: FastAPI) -> bool:
