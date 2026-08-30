@@ -277,6 +277,9 @@ class PerformanceTraceRegistry:
         status = "PASS"
         error_code: str | None = None
         if active.detached:
+            # A disconnected SSE client is a canonical cancellation.  Do not
+            # combine a socket-close exception with CLIENT_DISCONNECTED.
+            runtime_error = None
             status = "CANCELLED"
             error_code = "CLIENT_DISCONNECTED"
         elif runtime_error is not None:
