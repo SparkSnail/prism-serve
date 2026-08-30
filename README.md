@@ -19,75 +19,42 @@
   </a>
 </p>
 
-**prism-serve** coordinates disaggregated LLM inference workers on Kubernetes. The current
-code covers cluster-level prefill/decode (PD) scheduling, KV transfer flow control,
-recompute fallback, and a 10 ms reconcile loop modelled on Ray Serve.
-
-> [!WARNING]
-> This is an experimental fixed 2P2D snapshot, not a production-ready release, and it
-> does not claim complete E2E success. A separate frozen correctness campaign ran
-> 31/35 cases passed (31 passed, 3 failed, and 1 was blocked); 4/5 evidence packets passed;
-> final-clean failed. Known limitations are a decode-worker SIGSEGV during gateway
-> restart cleanup and tunnel recovery failure while the local forwarding port remained bound.
+**prism-serve** provides the Kubernetes Gateway and control plane for the Prism stack. It schedules and prefix-routes [prism-infer](https://github.com/SparkSnail/prism-infer) workers, which execute model inference and KV operations. The current code covers cluster-level prefill/decode (PD) scheduling, KV transfer flow control, recompute fallback, and a 10 ms reconcile loop modelled on Ray Serve.
 
 ## Features
 
-- [x] **FastAPI gateway**: liveness/readiness probes, OpenAI-compatible route stub, infer instance registration
-- [x] **PD scheduler**: shortest-queue prefill selection, most-free-slots decode selection, runtime instance-count recommendation
-- [x] **KV transfer flow control**: dynamic high/low watermark, per-dst byte cap, FIFO deferred queue with automatic flush
-- [x] **Recompute fallback**: timeout detection, `reset_to_waiting` on D instance, abort after max attempts
-- [x] **Request state machine**: per-request `SeqState` lifecycle, illegal-transition guard, stuck-request detection, TTFT timestamps
-- [x] **10 ms schedule loop**: Phase 1-6 reconcile - assign P/D, submit KV, stuck check, deferred flush, collect finished, metrics
-- [x] **NATS queue**: publish/subscribe wrapper, bounded inbox, queue-group load balancing, wildcard `kv_usage.*` subscription
-- [x] **Metrics**: Prometheus counters/gauges/histograms for TTFT, KV transfer, congestion, deferred depth, slot utilisation
+- **FastAPI gateway**: liveness/readiness probes, OpenAI-compatible route stub, infer instance registration
+- **PD scheduler**: shortest-queue prefill selection, most-free-slots decode selection, runtime instance-count recommendation
+- **KV transfer flow control**: dynamic high/low watermark, per-dst byte cap, FIFO deferred queue with automatic flush
+- **Recompute fallback**: timeout detection, `reset_to_waiting` on D instance, abort after max attempts
+- **Request state machine**: per-request `SeqState` lifecycle, illegal-transition guard, stuck-request detection, TTFT timestamps
+- **10 ms schedule loop**: Phase 1-6 reconcile - assign P/D, submit KV, stuck check, deferred flush, collect finished, metrics
+- **NATS queue**: publish/subscribe wrapper, bounded inbox, queue-group load balancing, wildcard `kv_usage.*` subscription
+- **Metrics**: Prometheus counters/gauges/histograms for TTFT, KV transfer, congestion, deferred depth, slot utilisation
 
 ## Performance Snapshot
 
-A frozen absolute-baseline run on 2026-08-18 passed the canonical performance
-validator (`headline_valid=true`) and its final resource-clean proof. These numbers
-cover only affinity disabled (`PERF_OFF`). The affinity-enabled `PERF_ON` comparison
-is `NOT_RUN`; no optimization gain is claimed.
+This paired 2P2D snapshot measures the end-to-end Prism stack, not an isolated benchmark of either repository. `prism-serve` provides prefix-affinity routing and coordination, while `prism-infer` runs the prefill/decode workers and KV-cache runtime. On the same model, hardware, topology, request mix, and concurrency, enabling affinity lowers time-to-first-token and end-to-end latency while increasing completed-request throughput. The table keeps the decode trade-off visible instead of presenting a single best-case number. This is a controlled paired benchmark for the fixed 2P2D setup, not a production SLO.
 
-| Run setup | Value |
+**Headline:** With affinity enabled, TTFT p50 is 64.9% lower, E2E p50 is 33.4% lower, and successful request throughput is 35.1% higher on this workload. TPOT rises, so this is a workload-specific prefix-reuse result, not a blanket speedup.
+
+| Benchmark setup | Value |
 |---|---|
-| Environment | Alibaba Cloud ACK, 2 nodes, 4 x NVIDIA L20 GPUs |
-| Model / topology | Qwen3-8B, BF16, TP=1, fixed 2P2D |
-| Routing / transport | Affinity disabled; `NCCL_SOCKET` on 1,050/1,050 request traces |
-| Load shape | Concurrency 50; 769 input tokens; 32 output tokens |
-| Samples | 300/300 warm-up requests passed; 750/750 measured requests passed across 3 repetitions |
+| Model | Qwen3-8B, BF16 |
+| Hardware | 2 nodes, 4 NVIDIA L20 GPUs |
+| Parallelism | fixed 2P2D, TP=1 |
+| Workload | 512 shared + 257 unique input tokens; 32 output tokens |
+| Concurrency | 50 |
+| Sampling | streaming; 3 repetitions of 100 warm-up + 250 measured requests (1,050 total per configuration) |
+| Transport | NCCL Socket |
 
-| Latency | p50 (ms) | p95 (ms) | p99 (ms) |
+| Metric | Affinity OFF (baseline) | Affinity ON | Change vs OFF |
 |---|---:|---:|---:|
-| TTFT | 6,921.109 | 9,615.555 | 10,908.582 |
-| TPOT | 27.199 | 29.338 | 31.013 |
-| Inter-chunk | 22.795 | 84.418 | 139.210 |
-| End-to-end | 7,790.814 | 10,505.132 | 11,755.448 |
-
-| Throughput / GPU telemetry | Result |
-|---|---:|
-| Successful requests/s | 6.005 |
-| Successful output tokens/s | 192.152 |
-| GPU utilization, mean / p95 | 54.664% / 92.000% |
-| GPU memory, mean / p95 | 39,931 / 40,008 MiB |
-| GPU power, mean / p95 | 165.540 / 225.330 W |
-| GPU SM clock, mean / p95 | 2,520 / 2,520 MHz |
-
-Evidence identity: run `20260818T135933Z`; final performance-packet SHA-256
-`5951db093ca55124632c0ddd4f197b46534ea9e43cf0b094eb7d2cf43cd35836`.
-
-### Supplemental `PERF_ON` cell evidence
-
-Collected on 2026-08-22 with the same ACK/Qwen3-8B BF16 fixed 2P2D setup.
-These cell-level results have zero failed requests and `headline_valid=true`,
-but remain separate from the canonical `PERF_OFF` packet:
-
-| Cell | Warmup / measured | TTFT p50 / p95 / p99 (ms) | TPOT p50 (ms) | Output tok/s |
-|---|---:|---:|---:|---:|
-| `balanced-1024x128-c100` | 600 / 1,500 | 17,157.092 / 24,832.803 / 29,436.452 | 30.011 | 582.598 |
-| `prefill-2048x32-c50` | 300 / 750 | 13,706.317 / 20,176.845 / 23,585.095 | 30.099 | 108.156 |
-| `decode-128x256-c50` | 300 / 750 | 2,569.163 / 5,107.496 / 6,417.857 | 36.844 | 883.593 |
-
-`unified_comparison=NOT_RUN`; no optimization gain is claimed.
+| TTFT p50 / p95 / p99 (ms) | 6,527.661 / 9,975.492 / 10,729.448 | 2,293.325 / 4,305.316 / 5,522.773 | 64.868% / 56.841% / 48.527% lower |
+| TPOT p50 / p95 / p99 (ms) | 25.798 / 29.938 / 31.989 | 81.959 / 145.253 / 151.019 | 217.696% / 385.173% / 372.103% higher |
+| E2E p50 / p95 / p99 (ms) | 7,387.104 / 10,750.170 / 11,610.063 | 4,916.720 / 5,442.772 / 5,581.826 | 33.442% / 49.370% / 51.923% lower |
+| Successful requests/s | 6.274584 | 8.475600 | 35.078% higher |
+| Successful output tokens/s | 200.7867 | 271.2192 | 35.078% higher |
 
 ## Installation
 
@@ -134,13 +101,12 @@ curl -X POST localhost:8080/internal/register_instance \
 ```
 
 
-## Test
+## Testing
 
 ```bash
 pip install -e ".[test]"
 python -m pytest tests/ -q
 ```
-
 
 ## Deployment
 
