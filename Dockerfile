@@ -125,10 +125,154 @@ ENV PRISM_IMAGE_VARIANT=performance \
     PRISM_SERVE_PREFIX_BLOCK_SIZE=256 \
     PRISM_SERVE_PREFIX_BLOCK_BYTES=37748736
 
+FROM profile-${PRISM_IMAGE_VARIANT} AS model-staging
+
+# ``model-cache`` is a required BuildKit named context. The Gateway only
+# stages tokenizer/config metadata and never downloads from the Hub.
+RUN --mount=type=bind,from=model-cache,source=.,target=/mnt/model-cache,ro \
+    python - <<'PY'
+import hashlib
+import json
+import os
+import shutil
+from pathlib import Path
+
+cache_root = Path("/mnt/model-cache").resolve()
+model_name = Path(os.environ["PRISM_MODEL"]).name
+candidates = (cache_root / model_name, cache_root)
+source = next(
+    (candidate.resolve() for candidate in candidates if (candidate / "config.json").is_file()),
+    None,
+)
+if source is None:
+    raise SystemExit(
+        "model-cache must be a model directory or contain "
+        f"{model_name}/config.json"
+    )
+try:
+    source.relative_to(cache_root)
+except ValueError as exc:
+    raise SystemExit("model-cache model path must stay inside the named context") from exc
+
+expected_revision = os.environ["PRISM_MODEL_REVISION"]
+expected_tokenizer_revision = os.environ["PRISM_TOKENIZER_REVISION"]
+expected_model_id = os.environ["PRISM_MODEL_ID"]
+revision_marker = source / ".prism-model-revision"
+if revision_marker.is_symlink() or not revision_marker.is_file():
+    raise SystemExit("model-cache is missing .prism-model-revision")
+actual_revision = revision_marker.read_text(encoding="utf-8").strip()
+if actual_revision != expected_revision:
+    raise SystemExit(
+        "model-cache revision mismatch: "
+        f"expected {expected_revision}, got {actual_revision}"
+    )
+
+manifest_path = source / ".prism-model-manifest.json"
+if manifest_path.is_symlink() or not manifest_path.is_file():
+    raise SystemExit("model-cache is missing .prism-model-manifest.json")
+try:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+except (OSError, ValueError) as exc:
+    raise SystemExit("model-cache manifest is not valid JSON") from exc
+if not isinstance(manifest, dict) or set(manifest) != {
+    "schema_version", "model_id", "revision", "tokenizer_revision",
+    "config_sha256", "files",
+}:
+    raise SystemExit("model-cache manifest has an invalid shape")
+if manifest["schema_version"] != "prism.local_model_cache/v1":
+    raise SystemExit("model-cache manifest schema_version is unsupported")
+if manifest["model_id"] != expected_model_id:
+    raise SystemExit("model-cache manifest model_id mismatch")
+if manifest["revision"] != expected_revision:
+    raise SystemExit("model-cache manifest revision mismatch")
+if manifest["tokenizer_revision"] != expected_tokenizer_revision:
+    raise SystemExit("model-cache manifest tokenizer_revision mismatch")
+expected_config_sha = os.environ["PRISM_MODEL_CONFIG_SHA256"]
+if manifest["config_sha256"] != expected_config_sha:
+    raise SystemExit("model-cache manifest config_sha256 mismatch")
+manifest_files = manifest["files"]
+if not isinstance(manifest_files, dict):
+    raise SystemExit("model-cache manifest files must be an object")
+
+target = Path(os.environ["PRISM_MODEL"])
+required_files = (
+    "config.json",
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+)
+optional_names = {
+    "special_tokens_map.json",
+    "merges.txt",
+    "vocab.json",
+    "tokenizer.model",
+    "model.safetensors.index.json",
+}
+
+def resolve_cache_file(relative_path):
+    relative_path = Path(relative_path)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise SystemExit("model-cache manifest contains an unsafe path")
+    source_file = (source / relative_path).resolve()
+    try:
+        source_file.relative_to(cache_root)
+    except ValueError as exc:
+        raise SystemExit("model-cache contains a file outside the named context") from exc
+    if not source_file.is_file():
+        raise SystemExit(f"model-cache is missing required file: {relative_path}")
+    return relative_path, source_file
+
+def verify_hash(relative_path, source_file):
+    manifest_key = relative_path.as_posix()
+    expected_hash = manifest_files.get(manifest_key)
+    if not isinstance(expected_hash, str) or len(expected_hash) != 64 \
+            or any(character not in "0123456789abcdef" for character in expected_hash):
+        raise SystemExit(f"model-cache manifest is missing {manifest_key}")
+    digest = hashlib.sha256()
+    with source_file.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != expected_hash:
+        raise SystemExit(f"model-cache file hash mismatch: {manifest_key}")
+
+def copy_from_cache(relative_path):
+    relative_path, source_file = resolve_cache_file(relative_path)
+    verify_hash(relative_path, source_file)
+    destination = target / relative_path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_file, destination)
+
+for relative_path in required_files:
+    copy_from_cache(relative_path)
+weight_files = sorted(source.glob("*.safetensors"))
+if not weight_files:
+    raise SystemExit("model-cache is missing safetensors weights")
+for weight_file in weight_files:
+    # The Gateway does not copy weights, but it still verifies every shard in
+    # the cache so its runtime identity cannot hide a mismatched worker image.
+    weight_key, resolved_weight = resolve_cache_file(weight_file.name)
+    verify_hash(weight_key, resolved_weight)
+for candidate in source.iterdir():
+    if candidate.is_file() and (
+        candidate.name in optional_names or candidate.name.startswith("chat_template")
+    ):
+        copy_from_cache(candidate.name)
+
+actual_config_sha = hashlib.sha256((target / "config.json").read_bytes()).hexdigest()
+if actual_config_sha != expected_config_sha:
+    raise SystemExit(
+        "config.json SHA-256 mismatch: "
+        f"expected {expected_config_sha}, got {actual_config_sha}"
+    )
+shutil.copy2(revision_marker, target / ".prism-model-revision")
+shutil.copy2(manifest_path, target / ".prism-model-manifest.json")
+PY
+
 FROM profile-${PRISM_IMAGE_VARIANT} AS selected
 
 ARG PRISM_IMAGE_VARIANT
-ARG GIT_SHA
+ARG GIT_SHA=local
+ARG PRISM_RELEASE=false
 ARG SOURCE_URL=https://github.com/SparkSnail/prism-serve
 
 RUN case "${PRISM_IMAGE_VARIANT}" in \
@@ -136,46 +280,15 @@ RUN case "${PRISM_IMAGE_VARIANT}" in \
       *) echo "PRISM_IMAGE_VARIANT must be correctness or performance" >&2; exit 64 ;; \
     esac
 
-ENV PRISM_IMAGE_GIT_SHA=${GIT_SHA}
+ENV PRISM_IMAGE_GIT_SHA=${GIT_SHA} \
+    PRISM_SERVE_IMAGE_SOURCE_URL=${SOURCE_URL} \
+    PRISM_SERVE_IMAGE_SOURCE_COMMIT=${GIT_SHA}
 
-# Gateway needs the pinned tokenizer/config snapshot, but no model weights.
-RUN --mount=type=cache,target=/root/.cache/huggingface \
-    python - <<'PY'
-import hashlib
-import os
-from pathlib import Path
+# The Gateway image carries tokenizer/config metadata only; workers own model
+# weights. Keeping this as a separate copy also makes the dependency explicit.
+COPY --link --from=model-staging /opt/models/ /opt/models/
 
-from huggingface_hub import snapshot_download
-
-target = Path(os.environ["PRISM_MODEL"])
-snapshot_download(
-    repo_id=os.environ["PRISM_MODEL_ID"],
-    revision=os.environ["PRISM_MODEL_REVISION"],
-    local_dir=target,
-    allow_patterns=[
-        "config.json",
-        "generation_config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-        "chat_template*",
-        "*.model",
-        "merges.txt",
-        "vocab.json",
-    ],
-)
-actual = hashlib.sha256((target / "config.json").read_bytes()).hexdigest()
-expected = os.environ["PRISM_MODEL_CONFIG_SHA256"]
-if actual != expected:
-    raise SystemExit(f"config.json SHA-256 mismatch: expected {expected}, got {actual}")
-if not (target / "tokenizer.json").is_file():
-    raise SystemExit("pinned snapshot is missing tokenizer.json")
-(target / ".prism-model-revision").write_text(
-    os.environ["PRISM_MODEL_REVISION"] + "\n", encoding="utf-8"
-)
-PY
-
-RUN python -c "import re,sys; assert re.fullmatch(r'[0-9a-f]{40}', sys.argv[1]), 'GIT_SHA must be a full lowercase commit SHA'" "${GIT_SHA}" && \
+RUN python -c "import re,sys; sha,release=sys.argv[1:]; valid_sha=bool(re.fullmatch(r'[0-9a-f]{40}', sha)); assert release in ('true','false'), 'PRISM_RELEASE must be true or false'; assert valid_sha or (release == 'false' and sha == 'local'), 'release images require a full lowercase commit SHA'; assert not (release == 'true' and sha == 'local'), 'PRISM_RELEASE=true requires a full lowercase commit SHA'" "${GIT_SHA}" "${PRISM_RELEASE}" && \
     python -c "from prism_serve.gateway.app import main; from prism_serve.gateway.performance_harness import PerformanceTraceRegistry; from prism_serve.process_identity import assert_pidfd_support; assert_pidfd_support()" && \
     mkdir -p /opt/prism/build && \
     python -m pip freeze --all > /tmp/prism-pip-freeze.txt && \
@@ -196,6 +309,14 @@ LABEL org.opencontainers.image.source="${SOURCE_URL}" \
       ai.sparksnail.prism.model.tokenizer-revision="${PRISM_TOKENIZER_REVISION}" \
       ai.sparksnail.prism.model.config-sha256="${PRISM_MODEL_CONFIG_SHA256}" \
       ai.sparksnail.prism.model.kv-compatibility-id="${PRISM_KV_COMPATIBILITY_ID}"
+
+# The Gateway only needs read access to the image and writes runtime state to
+# the mounted replacement store or /tmp. Keep the published image non-root.
+RUN addgroup --system --gid 10001 prism && \
+    adduser --system --uid 10001 --ingroup prism --no-create-home prism && \
+    mkdir -p /var/lib/prism/replacement && \
+    chown -R prism:prism /var/lib/prism
+USER prism
 
 EXPOSE 8080
 

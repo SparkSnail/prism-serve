@@ -262,7 +262,9 @@ def test_images_support_immutable_digest_and_reject_latest() -> None:
         "--set-string", f"worker.image.digest={digest}",
     ], check=True, capture_output=True, text=True).stdout
     assert f"sparksnail/prism-serve@{digest}" in rendered
-    assert rendered.count(f"sparksnail/prism-infer@{digest}") == 4
+    # Four worker Pods use this image and the Gateway exports the same full
+    # reference for runtime benchmark identity.
+    assert rendered.count(f"sparksnail/prism-infer@{digest}") == 5
 
     rejected = subprocess.run([
         "helm", "template", "week12", str(chart),
@@ -270,6 +272,86 @@ def test_images_support_immutable_digest_and_reject_latest() -> None:
     ], capture_output=True, text=True)
     assert rejected.returncode != 0
     assert "gateway image tag latest is forbidden" in rejected.stderr
+
+
+def test_default_images_use_published_release_tags() -> None:
+    rendered = _render_chart()
+    assert "sparksnail/prism-serve:v0.2.0" in rendered
+    assert "sparksnail/prism-infer:v0.3.0" in rendered
+    assert "unpublished" not in rendered
+
+
+def test_readme_requires_registry_manifest_preflight() -> None:
+    readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
+    assert "docker manifest inspect sparksnail/prism-serve:v0.2.0" in readme
+    assert "docker manifest inspect sparksnail/prism-infer:v0.3.0" in readme
+
+
+def test_gateway_pod_uses_non_root_runtime_security_context() -> None:
+    rendered = _rendered_document(_render_chart(), "gateway-deployment.yaml")
+    assert "runAsNonRoot: true" in rendered
+    assert "runAsUser: 10001" in rendered
+    assert "runAsGroup: 10001" in rendered
+    assert "fsGroup: 10001" in rendered
+    assert "type: RuntimeDefault" in rendered
+    assert "allowPrivilegeEscalation: false" in rendered
+    assert 'drop: ["ALL"]' in rendered
+
+
+def test_gateway_publishes_explicit_runtime_identity_inputs() -> None:
+    rendered = _rendered_document(_render_chart(), "gateway-deployment.yaml")
+    for name in (
+        "PRISM_SERVE_IMAGE_SOURCE_URL",
+        "PRISM_SERVE_IMAGE_SOURCE_COMMIT",
+        "PRISM_SERVE_IMAGE_DIGEST",
+        "PRISM_SERVE_WORKER_IMAGE_SOURCE_URL",
+        "PRISM_SERVE_WORKER_IMAGE_SOURCE_COMMIT",
+        "PRISM_SERVE_WORKER_IMAGE_DIGEST",
+    ):
+        assert f"- name: {name}" in rendered
+
+
+def test_image_identity_schema_rejects_malformed_source_commit() -> None:
+    chart = Path(__file__).parents[1] / "k8s" / "helm" / "prism-serve"
+    rejected = subprocess.run(
+        [
+            "helm", "template", "week12", str(chart),
+            "--set-string", "gateway.image.sourceCommit=working-tree",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode != 0
+    assert "sourceCommit" in rejected.stderr
+
+
+def test_worker_pods_use_non_root_runtime_security_context() -> None:
+    rendered = _render_chart()
+    rendered = next(
+        document
+        for document in rendered.split("---")
+        if "kind: StatefulSet" in document
+        and "name: week12-prism-serve-p0" in document
+    )
+    assert "runAsNonRoot: true" in rendered
+    assert "runAsUser: 10001" in rendered
+    assert "runAsGroup: 10001" in rendered
+    assert "fsGroup: 10001" in rendered
+    assert "type: RuntimeDefault" in rendered
+    assert "allowPrivilegeEscalation: false" in rendered
+    assert 'drop: ["ALL"]' in rendered
+
+
+def test_chart_version_matches_runtime_package() -> None:
+    chart = Path(__file__).parents[1] / "k8s" / "helm" / "prism-serve" / "Chart.yaml"
+    text = chart.read_text(encoding="utf-8")
+    assert "version: 0.2.0" in text
+    assert 'appVersion: "0.2.0"' in text
+
+
+def test_chart_does_not_render_unused_redis_configuration() -> None:
+    rendered = _render_chart()
+    assert "PRISM_SERVE_REDIS_URL" not in rendered
 
 
 def test_gateway_replacement_store_is_rwo_and_mounted() -> None:

@@ -1,0 +1,88 @@
+{
+  "schema_version": "prism.performance_snapshot/v1",
+  "evidence_status": "historical-immutable-reference",
+  "evidence_level": "multi-node-gpu-benchmark",
+  "status": "PASS",
+  "profile": {
+    "model": "Qwen/Qwen3-8B",
+    "model_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+    "dtype": "bfloat16",
+    "profile_id": "qwen3-8b-bf16-tp1",
+    "tensor_parallel_size": 1,
+    "tokens_per_block": 256,
+    "kv_block_bytes": 37748736,
+    "kv_layout": "NHDC"
+  },
+  "hardware": {
+    "nodes": 2,
+    "gpus": 4,
+    "gpu": "NVIDIA L20",
+    "transport": "NCCL_SOCKET"
+  },
+  "workload": {
+    "input_tokens": 769,
+    "shared_input_tokens": 512,
+    "unique_input_tokens": 257,
+    "output_tokens": 32,
+    "concurrency": 50,
+    "warmup_requests": 300,
+    "measured_requests": 750,
+    "repetitions": 3,
+    "sampling": "streaming"
+  },
+  "provenance": {
+    "gateway": {
+      "repository": "https://github.com/SparkSnail/prism-serve",
+      "source_commit": "8a97b95d4946f4399b99fc0425fef523b83b46a1",
+      "image": "sparksnail/prism-serve@sha256:fd27c0cf39a80b0bdcbf3fc21bbef1b9f576292c2d7df17747e1b0f037809070"
+    },
+    "worker": {
+      "repository": "https://github.com/SparkSnail/prism-infer",
+      "source_commit": "af553c2aff0ebcce8113df7aac57ed4c4e99bc8a",
+      "image": "sparksnail/prism-infer@sha256:dcd2d037a56a5495fd1f937feac4efef1c2f4066249fc398661ea8b348136288"
+    }
+  },
+  "metrics": {
+    "units": {
+      "latency": "ms",
+      "throughput": "requests_per_second",
+      "output_throughput": "tokens_per_second"
+    },
+    "affinity_off": {
+      "ttft_ms": {"p50": 6527.661, "p95": 9975.492, "p99": 10729.448},
+      "tpot_ms": {"p50": 25.798, "p95": 29.938, "p99": 31.989},
+      "e2e_ms": {"p50": 7387.104, "p95": 10750.17, "p99": 11610.063},
+      "successful_requests_per_second": 6.274584,
+      "successful_output_tokens_per_second": 200.7867
+    },
+    "affinity_on": {
+      "ttft_ms": {"p50": 2293.325, "p95": 4305.316, "p99": 5522.773},
+      "tpot_ms": {"p50": 81.959, "p95": 145.253, "p99": 151.019},
+      "e2e_ms": {"p50": 4916.72, "p95": 5442.772, "p99": 5581.826},
+      "successful_requests_per_second": 8.4756,
+      "successful_output_tokens_per_second": 271.2192
+    },
+    "on_vs_off_percent": {
+      "ttft": {"p50": -64.868, "p95": -56.841, "p99": -48.527},
+      "tpot": {"p50": 217.696, "p95": 385.173, "p99": 372.103},
+      "e2e": {"p50": -33.442, "p95": -49.37, "p99": -51.923},
+      "successful_requests_per_second": 35.078,
+      "successful_output_tokens_per_second": 35.078
+    }
+  },
+  "route": {
+    "affinity_off": {
+      "prefix_hit_rate": 0.0,
+      "saved_tokens": 0,
+      "mapping_count": 1000,
+      "completed_kv_bytes": 37748736000
+    },
+    "affinity_on": {
+      "prefix_hit_rate": 1.0,
+      "mapped_token_ratio": 0.6657997,
+      "saved_tokens": 128000,
+      "mapping_count": 0,
+      "completed_kv_bytes": 0
+    }
+  }
+}

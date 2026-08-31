@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Prism paired performance snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "evidence_status",
+    "evidence_level",
+    "status",
+    "profile",
+    "hardware",
+    "workload",
+    "provenance",
+    "metrics",
+    "route"
+  ],
+  "properties": {
+    "schema_version": {"const": "prism.performance_snapshot/v1"},
+    "evidence_status": {"const": "historical-immutable-reference"},
+    "evidence_level": {"const": "multi-node-gpu-benchmark"},
+    "status": {"const": "PASS"},
+    "profile": {"type": "object"},
+    "hardware": {"type": "object"},
+    "workload": {"type": "object"},
+    "provenance": {"type": "object"},
+    "metrics": {"type": "object"},
+    "route": {"type": "object"}
+  }
+}

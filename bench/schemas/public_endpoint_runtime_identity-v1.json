@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Prism public endpoint runtime identity",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "endpoint_path", "gateway", "worker", "model",
+    "topology_generation"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "prism.public_endpoint_runtime_identity/v1"
+    },
+    "endpoint_path": {
+      "const": "/v1/chat/completions"
+    },
+    "gateway": {"$ref": "#/$defs/component"},
+    "worker": {"$ref": "#/$defs/component"},
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+      }
+    },
+    "topology_generation": {"type": "string", "minLength": 1}
+  },
+  "$defs": {
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_commit", "image", "source_url"],
+      "properties": {
+        "source_commit": {
+          "type": "string", "pattern": "^[0-9a-f]{40}$"
+        },
+        "image": {
+          "type": "string",
+          "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"
+        },
+        "source_url": {
+          "type": "string", "format": "uri", "minLength": 1
+        }
+      }
+    }
+  }
+}

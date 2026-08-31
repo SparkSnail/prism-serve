@@ -26,7 +26,9 @@ def test_dockerfile_has_one_closed_variant_selector() -> None:
     assert "FROM profile-${PRISM_IMAGE_VARIANT} AS selected" in text
     assert "PRISM_IMAGE_VARIANT must be correctness or performance" in text
     assert not re.search(
-        r"^ARG PRISM_(?!IMAGE_VARIANT(?:=|$))", text, re.MULTILINE
+        r"^ARG PRISM_(?!IMAGE_VARIANT(?:=|$)|RELEASE(?:=|$))",
+        text,
+        re.MULTILINE,
     )
 
 
@@ -112,4 +114,31 @@ def test_dockerfile_exposes_full_oci_provenance_and_smoke_import() -> None:
     ):
         assert f"{key}=" in text
     assert "performance_harness import PerformanceTraceRegistry" in text
-    assert "GIT_SHA must be a full lowercase commit SHA" in text
+    assert "ARG GIT_SHA=local" in text
+    assert "ARG PRISM_RELEASE=false" in text
+    assert "PRISM_RELEASE=true requires a full lowercase commit SHA" in text
+    assert "USER prism" in text
+
+
+def test_dockerfile_stages_tokenizer_from_local_named_context() -> None:
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    readme = (DOCKERFILE.parent / "README.md").read_text(encoding="utf-8")
+
+    assert "FROM profile-${PRISM_IMAGE_VARIANT} AS model-staging" in text
+    assert (
+        "--mount=type=bind,from=model-cache,source=.,target=/mnt/model-cache,ro"
+        in text
+    )
+    assert "COPY --link --from=model-staging /opt/models/ /opt/models/" in text
+    assert "snapshot_download" not in text
+    assert "huggingface_hub" not in text
+    assert "model-cache must be a model directory" in text
+    assert "--build-context model-cache=" in readme
+    assert "does not download model files from Hugging Face" in readme
+    assert "model-cache is missing .prism-model-manifest.json" in text
+    assert '"prism.local_model_cache/v1"' in text
+    assert "file hash mismatch" in text
+    assert "model-cache is missing .prism-model-revision" in text
+    assert ".prism-model-manifest.json" in text
+    assert "write_text" not in text.split("FROM profile-${PRISM_IMAGE_VARIANT} AS model-staging", 1)[1].split("PY", 1)[0]
+    assert (DOCKERFILE.parent / "scripts" / "create_model_cache_manifest.py").is_file()

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "prism-serve synthetic CPU routing policy result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "requests",
+    "route_hit_rate",
+    "mapped_to_cold_bytes_ratio",
+    "router_elapsed_ms",
+    "claims_not_made"
+  ],
+  "properties": {
+    "kind": {"const": "synthetic_cpu_policy"},
+    "requests": {"type": "integer", "minimum": 1},
+    "route_hit_rate": {"type": "number", "minimum": 0, "maximum": 1},
+    "mapped_to_cold_bytes_ratio": {"type": "number", "minimum": 0},
+    "router_elapsed_ms": {"type": "number", "minimum": 0},
+    "claims_not_made": {
+      "type": "array",
+      "items": {"type": "string"},
+      "minItems": 1
+    }
+  }
+}

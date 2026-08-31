@@ -12,21 +12,29 @@ readme = "README.md"
 description = "Kubernetes control plane for disaggregated LLM serving with PD scheduling and KV-affinity routing"
 requires-python = ">=3.10"
 dependencies = [
-    "fastapi>=0.110",
-    "uvicorn[standard]>=0.29",
-    "pydantic>=2.6",
-    "pydantic-settings>=2.2",
-    "httpx>=0.27",
-    "nats-py>=2.7",
-    "prometheus-client>=0.20",
-    "xxhash>=3.0",
-    "transformers>=4.51.0",
+    "fastapi>=0.110,<1",
+    "uvicorn[standard]>=0.29,<1",
+    "pydantic>=2.6,<3",
+    "pydantic-settings>=2.2,<3",
+    "httpx>=0.27,<1",
+    "nats-py>=2.7,<3",
+    "prometheus-client>=0.20,<1",
+    "xxhash>=3,<4",
 ]
 
 [project.optional-dependencies]
 test = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+]
+harness = [
+    "transformers>=4.51,<5",
+]
+# The in-process adapter is only used by local CPU integration tests. The
+# production control plane talks to prism-infer over HTTP and does not import
+# the GPU engine at install or startup time.
+infer = [
+    "prism-infer @ git+https://github.com/SparkSnail/prism-infer.git@main",
 ]
 
 [project.urls]

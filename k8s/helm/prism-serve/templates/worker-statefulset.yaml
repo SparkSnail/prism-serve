@@ -60,6 +60,13 @@ spec:
         prism.sparksnail.ai/member: {{ $member.name }}
         prism.sparksnail.ai/topology-generation: {{ $.Values.worker.topologyGeneration | quote }}
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       {{- if $.Values.gateway.correctnessHarness.enabled }}
       shareProcessNamespace: true
       {{- end }}
@@ -89,6 +96,10 @@ spec:
         - name: worker
           image: {{ include "prism-serve.worker.image" $ }}
           imagePullPolicy: {{ $.Values.worker.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           command: ["prism-infer-worker"]
           ports:
             - name: rpc

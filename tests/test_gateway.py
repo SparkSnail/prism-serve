@@ -63,6 +63,66 @@ def test_readyz_not_ready_before_startup():
     assert r.status_code == 503
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"temperature": "0"},
+        {"temperature": True},
+        {"temperature": float("nan")},
+        {"max_tokens": "32"},
+        {"max_tokens": 1.5},
+        {"max_tokens": True},
+    ],
+)
+def test_sampling_rejects_non_json_numeric_controls(body):
+    with pytest.raises(ValueError, match="temperature|max_tokens"):
+        gateway_module._parse_sampling(body)
+
+
+def test_sampling_preserves_valid_numeric_controls():
+    assert gateway_module._parse_sampling(
+        {"temperature": 0.25, "max_tokens": 16, "ignore_eos": True}
+    ) == {"temperature": 0.25, "max_tokens": 16, "ignore_eos": True}
+
+
+def test_sampling_rejects_generation_budget_above_runtime_context_limit():
+    with pytest.raises(ValueError, match="max_tokens.*max_model_len"):
+        gateway_module._parse_sampling(
+            {"max_tokens": 65}, max_model_len=64
+        )
+
+
+def test_sampling_rejects_input_plus_generation_over_runtime_context_limit():
+    with pytest.raises(ValueError, match="input tokens.*max_model_len"):
+        gateway_module._parse_sampling(
+            {"max_tokens": 16}, input_token_count=49, max_model_len=64
+        )
+
+
+def test_sampling_accepts_exact_runtime_context_budget():
+    assert gateway_module._parse_sampling(
+        {"max_tokens": 16}, input_token_count=48, max_model_len=64
+    )["max_tokens"] == 16
+
+
+def test_chat_rejects_context_overflow_before_tracker_admission(monkeypatch):
+    monkeypatch.setattr(gateway_module.settings, "max_model_len", 2)
+    with sync_client() as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "request_id": "context-overflow",
+                "model": gateway_module.settings.model_id,
+                "messages": [{"role": "user", "content": "ignored"}],
+                "input_token_ids": [1, 2],
+                "max_tokens": 1,
+            },
+        )
+        assert response.status_code == 422
+        assert "max_model_len" in response.json()["detail"]
+        assert app.state.tracker.get("context-overflow") is None
+
+
 def test_readyz_not_ready_when_nats_disconnects():
     with sync_client() as client:
         app.state.queue._use_mock = False

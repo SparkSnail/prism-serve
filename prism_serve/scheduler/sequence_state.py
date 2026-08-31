@@ -162,7 +162,6 @@ class TransferTask:
     priority:    int = 1
     enqueued_at: float = field(default_factory=time.monotonic)
     on_complete: object = None  # Callable[[], None] | None
-    operation_id: str = ""
 
 
 def _validate_transition(current: SeqState, new: SeqState) -> None:

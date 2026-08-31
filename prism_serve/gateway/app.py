@@ -6,7 +6,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
+import re
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -37,6 +39,11 @@ GOVERNOR_SHUTDOWN_TIMEOUT_S = 30.0
 UVICORN_GRACEFUL_SHUTDOWN_TIMEOUT_S = 30.0
 NETWORK_CLEANUP_SHUTDOWN_TIMEOUT_S = 30.0
 RUNTIME_IO_CLOSE_SHUTDOWN_TIMEOUT_S = 15.0
+RUNTIME_IDENTITY_PATH = "/internal/week12/performance/runtime-identity"
+_RUNTIME_SHA40 = re.compile(r"^[0-9a-f]{40}$", re.ASCII)
+_RUNTIME_IMAGE_DIGEST = re.compile(
+    r"^[^\s@]+@sha256:[0-9a-f]{64}$", re.ASCII
+)
 CORRECTNESS_ENDPOINT_AUTHORITY_FAULTS = frozenset({
     "nats_disconnect",
     "nats_drop",
@@ -854,6 +861,131 @@ def _request_config(request: Request) -> dict:
     return value if isinstance(value, dict) else _build_config()
 
 
+def _runtime_identity_component(
+    *,
+    source_url: object,
+    source_commit: object,
+    image: object,
+    component: str,
+) -> dict[str, str]:
+    if not isinstance(source_url, str) or not source_url.startswith(
+        ("http://", "https://")
+    ):
+        raise RuntimeError(f"{component} source URL is incomplete")
+    if not isinstance(source_commit, str) \
+            or _RUNTIME_SHA40.fullmatch(source_commit) is None:
+        raise RuntimeError(f"{component} source commit is incomplete")
+    if not isinstance(image, str) \
+            or _RUNTIME_IMAGE_DIGEST.fullmatch(image) is None:
+        raise RuntimeError(f"{component} image digest is incomplete")
+    return {
+        "source_commit": source_commit,
+        "image": image,
+        "source_url": source_url,
+    }
+
+
+def _runtime_identity_payload(request: Request) -> dict[str, object]:
+    config = _request_config(request)
+    if not bool(config.get("performance_harness_enabled")):
+        raise RuntimeError("performance harness is disabled")
+
+    # A manifest is useful only after this Gateway has observed the exact
+    # four-member world; otherwise its topology claim is merely declarative.
+    topology = _performance_world_identity(request.app)
+    topology_generation = topology.get("topology_generation")
+    if not isinstance(topology_generation, str) or not topology_generation:
+        raise RuntimeError("performance topology generation is incomplete")
+    model_id = config.get("model_id")
+    model_revision = config.get("model_revision")
+    if not isinstance(model_id, str) or not model_id \
+            or not isinstance(model_revision, str) \
+            or _RUNTIME_SHA40.fullmatch(model_revision) is None:
+        raise RuntimeError("performance model identity is incomplete")
+    return {
+        "schema_version": "prism.public_endpoint_runtime_identity/v1",
+        "endpoint_path": "/v1/chat/completions",
+        "gateway": _runtime_identity_component(
+            source_url=config.get("image_source_url"),
+            source_commit=config.get("image_source_commit"),
+            image=config.get("image_digest"),
+            component="gateway",
+        ),
+        "worker": _runtime_identity_component(
+            source_url=config.get("worker_image_source_url"),
+            source_commit=config.get("worker_image_source_commit"),
+            image=config.get("worker_image_digest"),
+            component="worker",
+        ),
+        "model": {"id": model_id, "revision": model_revision},
+        "topology_generation": topology_generation,
+    }
+
+
+@app.get(RUNTIME_IDENTITY_PATH)
+def runtime_identity(request: Request) -> JSONResponse:
+    error = _performance_auth_error(request)
+    if error is not None:
+        return error
+    try:
+        return JSONResponse(_runtime_identity_payload(request))
+    except RuntimeError as exc:
+        return JSONResponse(
+            {"error": "runtime_identity_unavailable", "detail": str(exc)},
+            status_code=503,
+        )
+
+
+def _parse_sampling(
+    body: dict[str, object],
+    *,
+    input_token_count: int | None = None,
+    max_model_len: int | None = None,
+) -> dict[str, object]:
+    """Validate generation controls and the runtime context budget."""
+    raw_temperature = body.get("temperature", 0.0)
+    raw_max_tokens = body.get("max_tokens", 32)
+    if (
+        isinstance(raw_temperature, bool)
+        or not isinstance(raw_temperature, (int, float))
+        or isinstance(raw_max_tokens, bool)
+        or type(raw_max_tokens) is not int
+    ):
+        raise ValueError("temperature and max_tokens must be numeric")
+    try:
+        temperature = float(raw_temperature)
+        max_tokens = raw_max_tokens
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("temperature and max_tokens must be numeric") from exc
+    if not math.isfinite(temperature) or temperature < 0:
+        raise ValueError("temperature must be finite and non-negative")
+    if max_tokens <= 0:
+        raise ValueError("max_tokens must be positive")
+    if max_model_len is not None:
+        if type(max_model_len) is not int or max_model_len <= 0:
+            raise ValueError("runtime max_model_len must be a positive integer")
+        if max_tokens > max_model_len:
+            raise ValueError("max_tokens must not exceed runtime max_model_len")
+    if input_token_count is not None:
+        if type(input_token_count) is not int or input_token_count < 0:
+            raise ValueError("input token count must be a non-negative integer")
+        context_limit = max_model_len
+        if context_limit is None:
+            context_limit = settings.max_model_len
+        if type(context_limit) is not int or context_limit <= 0:
+            raise ValueError("runtime max_model_len must be a positive integer")
+        if input_token_count + max_tokens > context_limit:
+            raise ValueError(
+                "input tokens plus max_tokens must not exceed "
+                "runtime max_model_len"
+            )
+    return {
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "ignore_eos": body.get("ignore_eos") is True,
+    }
+
+
 def _correctness_auth_error(request: Request) -> JSONResponse | None:
     return _operator_auth_error(
         request, enabled_key="correctness_harness_enabled"
@@ -999,6 +1131,16 @@ async def chat_completions(request: Request):
         return JSONResponse(
             {"error": "invalid_request", "detail": str(exc)}, status_code=422
         )
+    try:
+        sampling = _parse_sampling(
+            body,
+            input_token_count=len(token_ids),
+            max_model_len=config.get("max_model_len", settings.max_model_len),
+        )
+    except ValueError as exc:
+        return JSONResponse(
+            {"error": "invalid_request", "detail": str(exc)}, status_code=422
+        )
     tracker = getattr(request.app.state, "tracker", None)
     output_buffer = getattr(request.app.state, "output_buffer", None)
     if tracker is None or output_buffer is None:
@@ -1006,11 +1148,6 @@ async def chat_completions(request: Request):
     from prism_serve.scheduler.sequence_state import RequestInfo
 
     req_id = str(body.get("request_id") or f"chatcmpl-{uuid.uuid4().hex}")
-    sampling = {
-        "temperature": float(body.get("temperature", 0.0)),
-        "max_tokens": int(body.get("max_tokens", 32)),
-        "ignore_eos": body.get("ignore_eos") is True,
-    }
     if correctness_route is not None:
         if body.get("stream", False):
             return JSONResponse(
@@ -3511,6 +3648,12 @@ def _build_config() -> dict:
         "performance_harness_enabled": settings.performance_harness_enabled,
         "route_parity_harness_enabled": settings.route_parity_harness_enabled,
         "performance_trace_cap": settings.performance_trace_cap,
+        "image_source_url": settings.image_source_url,
+        "image_source_commit": settings.image_source_commit,
+        "image_digest": settings.image_digest,
+        "worker_image_source_url": settings.worker_image_source_url,
+        "worker_image_source_commit": settings.worker_image_source_commit,
+        "worker_image_digest": settings.worker_image_digest,
         "correctness_harness_secret": settings.correctness_harness_secret,
         "correctness_fault_gate_timeout_s": (
             settings.correctness_fault_gate_timeout_s

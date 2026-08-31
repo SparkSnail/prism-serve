@@ -33,11 +33,11 @@ gateway:
     enabled: true
   performanceTraceCap: 8192
   image:
-    tag: week12-perf-qwen3-8b-unpublished
+    tag: v0.2.0-qwen3-8b
 
 worker:
   image:
-    tag: week12-perf-qwen3-8b-unpublished
+    tag: v0.3.0-qwen3-8b
   gpu:
     type: l20
 

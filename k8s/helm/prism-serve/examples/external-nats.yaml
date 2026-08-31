@@ -1,0 +1,9 @@
+# Example values for a two-stage install with an operator-managed NATS.
+# Replace the endpoint with the NATS service reachable from the prism namespace.
+nats:
+  url: nats://nats.nats-system.svc.cluster.local:4222
+
+# Keep workers stopped until pd_worldctl has observed the fresh Pods and issued
+# the identity-bound startup permit.
+worker:
+  replicas: 0

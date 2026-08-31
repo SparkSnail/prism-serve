@@ -18,7 +18,6 @@ class Settings(BaseSettings):
     port: int = 8080
     log_level: str = "info"
 
-    redis_url: str = "redis://localhost:6379/0"
     nats_url:  str = "nats://localhost:4222"
     nats_connect_timeout_s: float = 2.0
     nats_max_reconnect_attempts: int = 60
@@ -133,6 +132,15 @@ class Settings(BaseSettings):
     prefix_operation_watchdog_s: float = 1.0
     prefix_block_bytes: int = 0
     prefill_ms_per_token: float = 0.05
+
+    # Immutable build/deployment identity used by the operator benchmark. The
+    # identity endpoint stays unavailable until every field is supplied.
+    image_source_url: str = "https://github.com/SparkSnail/prism-serve"
+    image_source_commit: str = ""
+    image_digest: str = ""
+    worker_image_source_url: str = "https://github.com/SparkSnail/prism-infer"
+    worker_image_source_commit: str = ""
+    worker_image_digest: str = ""
 
     min_decode_instances: int = 1
     max_decode_instances: int = 64

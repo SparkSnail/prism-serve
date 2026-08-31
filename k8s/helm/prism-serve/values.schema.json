@@ -1,14 +1,14 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
-  "required": ["model", "parallel", "gateway", "worker", "affinity"],
+  "required": ["model", "parallel", "gateway", "worker", "nats", "affinity"],
   "properties": {
     "gateway": {
       "type": "object",
       "required": [
         "replicas", "terminationGracePeriodSeconds", "startupProbe",
         "topologyGeneration", "correctnessHarness", "performanceHarness",
-        "routeParityHarness", "performanceTraceCap"
+        "routeParityHarness", "performanceTraceCap", "image"
       ],
       "properties": {
         "replicas": {"const": 1},
@@ -49,7 +49,31 @@
           "properties": {"enabled": {"type": "boolean"}},
           "additionalProperties": false
         },
-        "performanceTraceCap": {"const": 8192}
+        "performanceTraceCap": {"const": 8192},
+        "image": {
+          "type": "object",
+          "required": [
+            "repository", "tag", "digest", "sourceUrl", "sourceCommit",
+            "pullPolicy"
+          ],
+          "properties": {
+            "repository": {"type": "string", "minLength": 1},
+            "tag": {"type": "string", "minLength": 1},
+            "digest": {
+              "type": "string", "pattern": "^(|sha256:[0-9a-f]{64})$"
+            },
+            "sourceUrl": {
+              "type": "string", "format": "uri", "minLength": 1
+            },
+            "sourceCommit": {
+              "type": "string", "pattern": "^(|[0-9a-f]{40})$"
+            },
+            "pullPolicy": {
+              "type": "string", "enum": ["IfNotPresent", "Always"]
+            }
+          },
+          "additionalProperties": false
+        }
       }
     },
     "parallel": {
@@ -138,7 +162,7 @@
       "type": "object",
       "required": [
         "topologyGeneration", "members", "rendezvousPort",
-        "requireGpudirectRdma", "maxBytesInflightPerPair", "nccl"
+        "requireGpudirectRdma", "maxBytesInflightPerPair", "nccl", "image"
       ],
       "properties": {
         "replicas": {"type": "integer", "minimum": 0, "maximum": 1},
@@ -172,6 +196,30 @@
             "type": "object",
             "required": ["name", "role", "globalRank", "nodeGroup"]
           }
+        },
+        "image": {
+          "type": "object",
+          "required": [
+            "repository", "tag", "digest", "sourceUrl", "sourceCommit",
+            "pullPolicy"
+          ],
+          "properties": {
+            "repository": {"type": "string", "minLength": 1},
+            "tag": {"type": "string", "minLength": 1},
+            "digest": {
+              "type": "string", "pattern": "^(|sha256:[0-9a-f]{64})$"
+            },
+            "sourceUrl": {
+              "type": "string", "format": "uri", "minLength": 1
+            },
+            "sourceCommit": {
+              "type": "string", "pattern": "^(|[0-9a-f]{40})$"
+            },
+            "pullPolicy": {
+              "type": "string", "enum": ["IfNotPresent", "Always"]
+            }
+          },
+          "additionalProperties": false
         }
       }
     },
@@ -179,6 +227,18 @@
       "type": "object",
       "required": ["enabled"],
       "properties": {"enabled": {"type": "boolean"}}
+    },
+    "nats": {
+      "type": "object",
+      "required": ["url"],
+      "properties": {
+        "url": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^nats://[^\\s]+$"
+        }
+      },
+      "additionalProperties": false
     }
   },
   "allOf": [

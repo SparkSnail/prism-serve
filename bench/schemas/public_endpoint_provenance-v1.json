@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Prism public endpoint benchmark provenance",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "gateway", "worker", "model", "topology_generation",
+    "binding"
+  ],
+  "properties": {
+    "schema_version": {"const": "prism.public_endpoint_provenance/v1"},
+    "gateway": {
+      "type": "object",
+      "required": ["source_commit", "image", "source_url"],
+      "additionalProperties": false,
+      "properties": {
+        "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "image": {"type": "string", "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"},
+        "source_url": {"type": "string", "format": "uri", "minLength": 1}
+      }
+    },
+    "worker": {
+      "type": "object",
+      "required": ["source_commit", "image", "source_url"],
+      "additionalProperties": false,
+      "properties": {
+        "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "image": {"type": "string", "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"},
+        "source_url": {"type": "string", "format": "uri", "minLength": 1}
+      }
+    },
+    "model": {
+      "type": "object",
+      "required": ["id", "revision"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+      }
+    },
+    "topology_generation": {"type": "string", "minLength": 1},
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "endpoint", "model", "cell", "requests", "concurrency",
+        "expected_input_tokens", "expected_output_tokens", "prompt_sha256"
+      ],
+      "properties": {
+        "endpoint": {"type": "string", "minLength": 1},
+        "model": {"type": "string", "minLength": 1},
+        "cell": {"type": "string", "minLength": 1},
+        "requests": {"type": "integer", "minimum": 1},
+        "concurrency": {"type": "integer", "minimum": 1},
+        "expected_input_tokens": {
+          "type": ["integer", "null"], "minimum": 1, "maximum": 4096
+        },
+        "expected_output_tokens": {
+          "type": "integer", "minimum": 2, "maximum": 256
+        },
+        "prompt_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

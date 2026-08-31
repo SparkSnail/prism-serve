@@ -54,8 +54,10 @@ gateway:
   performanceTraceCap: 8192
   image:
     repository: sparksnail/prism-serve
-    tag: "week12-unpublished" # override with an immutable source-revision tag
+    tag: "v0.2.0" # override with an immutable digest for production
     digest: ""                 # production: sha256:... takes precedence
+    sourceUrl: https://github.com/SparkSnail/prism-serve
+    sourceCommit: ""            # required for paired benchmark identity
     pullPolicy: IfNotPresent
   port: 8080
   resources:
@@ -107,8 +109,10 @@ worker:
     b: {prism.sparksnail.ai/pd-node-group: b}
   image:
     repository: sparksnail/prism-infer
-    tag: "week12-unpublished" # override with an immutable source-revision tag
+    tag: "v0.3.0" # override with an immutable digest for production
     digest: ""                 # production: sha256:... takes precedence
+    sourceUrl: https://github.com/SparkSnail/prism-infer
+    sourceCommit: ""            # required for paired benchmark identity
     pullPolicy: IfNotPresent
   port: 8001
   gpu:
@@ -129,8 +133,8 @@ worker:
 # ---------------------------------------------------------------------------
 # Backing services.
 # ---------------------------------------------------------------------------
-redis:
-  url: redis://redis:6379/0
+# The chart does not install NATS. Point this at an already reachable NATS
+# service before installing; the Gateway and all workers require it by default.
 nats:
   url: nats://nats:4222
 

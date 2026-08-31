@@ -19,6 +19,13 @@ spec:
         {{- include "prism-serve.gateway.selectorLabels" . | nindent 8 }}
     spec:
       terminationGracePeriodSeconds: {{ .Values.gateway.terminationGracePeriodSeconds }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       {{- if .Values.gateway.correctnessHarness.enabled }}
       shareProcessNamespace: true
       {{- end }}
@@ -30,6 +37,10 @@ spec:
         - name: gateway
           image: {{ include "prism-serve.gateway.image" . }}
           imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           command: ["prism-serve"]
           ports:
             - name: http
@@ -37,8 +48,6 @@ spec:
           env:
             - name: PRISM_SERVE_PORT
               value: {{ .Values.gateway.port | quote }}
-            - name: PRISM_SERVE_REDIS_URL
-              value: {{ .Values.redis.url | quote }}
             - name: PRISM_SERVE_NATS_URL
               value: {{ .Values.nats.url | quote }}
             - name: PRISM_SERVE_GATEWAY_POD_UID
@@ -63,6 +72,18 @@ spec:
               value: {{ .Values.gateway.routeParityHarness.enabled | quote }}
             - name: PRISM_SERVE_PERFORMANCE_TRACE_CAP
               value: {{ .Values.gateway.performanceTraceCap | quote }}
+            - name: PRISM_SERVE_IMAGE_SOURCE_URL
+              value: {{ .Values.gateway.image.sourceUrl | quote }}
+            - name: PRISM_SERVE_IMAGE_SOURCE_COMMIT
+              value: {{ .Values.gateway.image.sourceCommit | quote }}
+            - name: PRISM_SERVE_IMAGE_DIGEST
+              value: {{ include "prism-serve.gateway.image" . | quote }}
+            - name: PRISM_SERVE_WORKER_IMAGE_SOURCE_URL
+              value: {{ .Values.worker.image.sourceUrl | quote }}
+            - name: PRISM_SERVE_WORKER_IMAGE_SOURCE_COMMIT
+              value: {{ .Values.worker.image.sourceCommit | quote }}
+            - name: PRISM_SERVE_WORKER_IMAGE_DIGEST
+              value: {{ include "prism-serve.worker.image" . | quote }}
             - name: PRISM_SERVE_CORRECTNESS_FAULT_GATE_TIMEOUT_S
               value: {{ .Values.gateway.correctnessHarness.faultGateTimeoutSeconds | quote }}
             {{- if $operatorHarnessEnabled }}

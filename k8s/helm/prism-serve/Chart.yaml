@@ -2,8 +2,8 @@ apiVersion: v2
 name: prism-serve
 description: Kubernetes control plane for disaggregated LLM serving
 type: application
-version: 0.0.1
-appVersion: "0.0.1"
+version: 0.2.0
+appVersion: "0.2.0"
 home: https://github.com/SparkSnail/prism-serve
 sources:
   - https://github.com/SparkSnail/prism-serve

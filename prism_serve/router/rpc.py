@@ -44,7 +44,13 @@ class InProcessPrefixCacheRPC:
     async def prepare_prefix(
         self, target, target_epoch, operation_id, req_id, **kwargs
     ):
-        from prism_infer.sampling_params import SamplingParams
+        try:
+            from prism_infer.sampling_params import SamplingParams
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "InProcessPrefixCacheRPC requires the optional prism-infer "
+                "adapter; install prism-serve[infer]"
+            ) from exc
 
         service = self._service(target, target_epoch)
         params = kwargs["sampling_params"]
@@ -59,7 +65,13 @@ class InProcessPrefixCacheRPC:
         )
 
     async def transfer_cached_prefix(self, plan: CachedPrefixPlan):
-        from prism_infer.engine.kv_transfer import MappedPrefixTransferReq
+        try:
+            from prism_infer.engine.kv_transfer import MappedPrefixTransferReq
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "InProcessPrefixCacheRPC requires the optional prism-infer "
+                "adapter; install prism-serve[infer]"
+            ) from exc
 
         source = self._service(plan.source_instance, plan.source_epoch)
         target = self._service(plan.target_instance, plan.target_epoch)
