@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="#features"><b>Features</b></a> &middot;
-  <a href="#performance-snapshot"><b>Performance</b></a> &middot;
+  <a href="#reference-performance-snapshot"><b>Performance</b></a> &middot;
   <a href="#installation"><b>Installation</b></a> &middot;
   <a href="#quick-start"><b>Quick Start</b></a> &middot;
   <a href="#testing"><b>Testing</b></a> &middot;
@@ -20,13 +20,6 @@
 </p>
 
 **prism-serve** provides the Kubernetes Gateway and control plane for the Prism stack. It schedules and prefix-routes [prism-infer](https://github.com/SparkSnail/prism-infer) workers, which execute model inference and KV operations. The current code covers cluster-level prefill/decode (PD) scheduling, KV transfer flow control, recompute fallback, and a 10 ms reconcile loop modelled on Ray Serve.
-
-> [!NOTE]
-> The released chart and benchmark use a fixed experimental 2P2D profile: one
-> Gateway and four TP=1 workers (`p0`, `p1`, `d0`, `d1`). It is a reproducible
-> reference deployment, not a general autoscaling, HA, or production-SLO
-> configuration. Use immutable image digests when deploying outside a test
-> cluster.
 
 ## Features
 
