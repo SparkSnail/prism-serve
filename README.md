@@ -179,7 +179,18 @@ python scripts/pd_worldctl.py initialize \
 
 The deployment becomes ready only after all four workers report the same generation and the controller accepts the resulting evidence. Node labels `prism.sparksnail.ai/pd-node-group=a|b`, one NVIDIA GPU per worker, and a dynamic storage class for the replacement PVC are required by the default values.
 
-The 8B benchmark profile is an explicit overlay and keeps affinity opt-in. Resolve matching `-qwen3-8b` image tags from the registry, then pin the resulting image digests:
+The 8B benchmark profile is an explicit overlay and keeps affinity opt-in. Its authenticated benchmark endpoints read a token from a Kubernetes Secret. Generate one token and create the Secret before installing the overlay; pass the same value to the benchmark client through `PRISM_OPERATOR_TOKEN`:
+
+```bash
+export PRISM_OPERATOR_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+kubectl create namespace prism --dry-run=client -o yaml | kubectl apply -f -
+kubectl create secret generic prism-serve-harness \
+  -n prism \
+  --from-literal=token="$PRISM_OPERATOR_TOKEN" \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+Resolve matching `-qwen3-8b` image tags from the registry, then pin the resulting image digests:
 
 ```bash
 helm install prism-serve k8s/helm/prism-serve \

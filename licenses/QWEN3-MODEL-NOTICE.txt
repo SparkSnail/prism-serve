@@ -1,0 +1,24 @@
+Qwen3 model attribution
+=======================
+
+This image includes configuration and tokenizer metadata from the following
+Qwen3 models:
+
+  - Qwen/Qwen3-0.6B
+  - Qwen/Qwen3-8B
+
+Copyright 2024 Alibaba Cloud.
+
+The Qwen3 model materials are licensed under the Apache License, Version 2.0.
+The Apache License, Version 2.0 text is included in `/app/LICENSE`.
+The license text is available at:
+
+  https://www.apache.org/licenses/LICENSE-2.0
+
+Model cards and the corresponding license files:
+
+  https://huggingface.co/Qwen/Qwen3-0.6B
+  https://huggingface.co/Qwen/Qwen3-8B
+
+This notice is distributed with the image so the model attribution remains
+available when the image is used without the source repository checkout.

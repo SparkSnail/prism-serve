@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 DOCKERFILE = ROOT / "docker" / "Dockerfile"
 DOCKER_GUIDE = DOCKERFILE.parent / "README.md"
+MODEL_NOTICE = ROOT / "licenses" / "QWEN3-MODEL-NOTICE.txt"
 
 
 def _stage(text: str, name: str, next_name: str) -> str:
@@ -126,6 +127,18 @@ def test_dockerfile_exposes_full_oci_provenance_and_smoke_import() -> None:
     assert "ARG PRISM_RELEASE=false" in text
     assert "PRISM_RELEASE=true requires a full lowercase commit SHA" in text
     assert "USER prism" in text
+    assert "COPY licenses/QWEN3-MODEL-NOTICE.txt /opt/prism/licenses/QWEN3-MODEL-NOTICE.txt" in text
+
+
+def test_dockerfile_carries_qwen_model_attribution_into_the_image() -> None:
+    text = DOCKERFILE.read_text(encoding="utf-8")
+
+    assert MODEL_NOTICE.is_file()
+    notice = MODEL_NOTICE.read_text(encoding="utf-8")
+    assert "Qwen3-0.6B" in notice
+    assert "Qwen3-8B" in notice
+    assert "Apache License, Version 2.0" in notice
+    assert "COPY licenses/QWEN3-MODEL-NOTICE.txt" in text
 
 
 def test_dockerfile_stages_tokenizer_from_local_named_context() -> None:

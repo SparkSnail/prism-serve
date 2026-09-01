@@ -24,7 +24,7 @@ model:
 gateway:
   correctnessHarness:
     enabled: false
-    secretName: week12-harness
+    secretName: prism-serve-harness
     secretKey: token
     faultGateTimeoutSeconds: 1200
   performanceHarness:

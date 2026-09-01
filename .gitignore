@@ -36,3 +36,6 @@ charts/*.lock
 
 # Local env
 .env
+
+# Local cluster-controller state
+.prism-state/

@@ -283,8 +283,13 @@ def test_default_images_use_published_release_tags() -> None:
 
 def test_readme_requires_registry_manifest_preflight() -> None:
     readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
-    assert "docker manifest inspect sparksnail/prism-serve:v0.2.0" in readme
-    assert "docker manifest inspect sparksnail/prism-infer:v0.3.0" in readme
+    assert 'GATEWAY_TAG="<gateway-release-tag>"' in readme
+    assert 'WORKER_TAG="<worker-release-tag>"' in readme
+    assert 'docker manifest inspect "sparksnail/prism-serve:$GATEWAY_TAG"' in readme
+    assert 'docker manifest inspect "sparksnail/prism-infer:$WORKER_TAG"' in readme
+    assert "kubectl create namespace prism --dry-run=client -o yaml" in readme
+    assert "kubectl create secret generic prism-serve-harness" in readme
+    assert 'PRISM_OPERATOR_TOKEN="$(python -c' in readme
 
 
 def test_gateway_pod_uses_non_root_runtime_security_context() -> None:
@@ -484,6 +489,7 @@ def test_performance_overlay_enables_parity_without_fault_authority() -> None:
         '- name: PRISM_SERVE_PERFORMANCE_TRACE_CAP\n'
         '              value: "8192"'
     ) == 1
+    assert 'name: "prism-serve-harness"' in off
     for rendered, affinity in ((off, "false"), (on, "true")):
         assert "shareProcessNamespace:" not in rendered
         assert "PRISM_SERVE_PROCESS_IDENTITY_PATH" not in rendered
