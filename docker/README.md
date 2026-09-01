@@ -42,7 +42,7 @@ docker build \
 
 The Gateway image contains verified configuration and tokenizer metadata only; the paired `prism-infer` worker image owns the safetensors weights. The cache manifest records the model and tokenizer revisions and SHA-256 values for its files. A missing marker, mismatched revision, missing file, or SHA-256 mismatch fails the build. Keep model bytes outside the application build context so they are supplied only through `model-cache`.
 
-The image also carries `licenses/QWEN3-MODEL-NOTICE.txt` under `/opt/prism/licenses/` so the Qwen3 model attribution and Apache-2.0 license reference remain available with the metadata-only image.
+The image also carries the Qwen3 attribution notice and Apache-2.0 license under `/opt/prism/licenses/` so the model terms remain available with the metadata-only image. The source copies are documented in the repository [third-party notices](../licenses/README.md).
 
 ## Create cache identity
 

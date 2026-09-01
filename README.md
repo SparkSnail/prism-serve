@@ -208,3 +208,7 @@ For a paired public benchmark, the image digests and commits must describe the s
 ## License
 
 [Apache-2.0](LICENSE)
+
+Container profiles include Qwen3 model metadata under Apache-2.0. See the
+[third-party model notices](licenses/README.md) for the attribution and
+corresponding license text.

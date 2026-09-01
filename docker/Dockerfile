@@ -287,7 +287,9 @@ ENV PRISM_IMAGE_GIT_SHA=${GIT_SHA} \
 # The Gateway image carries tokenizer/config metadata only; workers own model
 # weights. Keeping this as a separate copy also makes the dependency explicit.
 COPY --link --from=model-staging /opt/models/ /opt/models/
+COPY licenses/README.md /opt/prism/licenses/README.md
 COPY licenses/QWEN3-MODEL-NOTICE.txt /opt/prism/licenses/QWEN3-MODEL-NOTICE.txt
+COPY licenses/APACHE-2.0.txt /opt/prism/licenses/APACHE-2.0.txt
 
 RUN python -c "import re,sys; sha,release=sys.argv[1:]; valid_sha=bool(re.fullmatch(r'[0-9a-f]{40}', sha)); assert release in ('true','false'), 'PRISM_RELEASE must be true or false'; assert valid_sha or (release == 'false' and sha == 'local'), 'release images require a full lowercase commit SHA'; assert not (release == 'true' and sha == 'local'), 'PRISM_RELEASE=true requires a full lowercase commit SHA'" "${GIT_SHA}" "${PRISM_RELEASE}" && \
     python -c "from prism_serve.gateway.app import main; from prism_serve.gateway.performance_harness import PerformanceTraceRegistry; from prism_serve.process_identity import assert_pidfd_support; assert_pidfd_support()" && \
