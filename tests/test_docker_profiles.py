@@ -145,6 +145,8 @@ def test_dockerfile_stages_tokenizer_from_local_named_context() -> None:
     assert "-f docker/Dockerfile" in guide
     assert "--build-context model-cache=" in guide
     assert "never downloads a model" in guide
+    assert "<release-tag>" in guide
+    assert not re.search(r"\bv\d+\.\d+\.\d+\b", guide)
     assert "[Docker guide](docker/README.md)" in readme
     assert "model-cache is missing .prism-model-manifest.json" in text
     assert '"prism.local_model_cache/v1"' in text

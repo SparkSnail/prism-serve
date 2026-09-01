@@ -4,16 +4,14 @@ This directory contains the Docker build definition for the Prism Gateway. The b
 
 Run every command from the repository root. `docker/Dockerfile` is intentionally separate from the application entry point, but the build context must remain `.` because the image copies the package, metadata, license, and README from the repository root. The root `.dockerignore` continues to filter that context.
 
-## Published images
-
-The first public container release follows package version `v0.2.0`:
+## Image profiles
 
 | Image | Profile |
 | --- | --- |
-| `sparksnail/prism-serve:v0.2.0` | Qwen3-0.6B correctness Gateway |
-| `sparksnail/prism-serve:v0.2.0-qwen3-8b` | Qwen3-8B performance Gateway |
+| `sparksnail/prism-serve:<release-tag>` | Qwen3-0.6B correctness Gateway |
+| `sparksnail/prism-serve:<release-tag>-qwen3-8b` | Qwen3-8B performance Gateway |
 
-Tags are release aliases. Pin an image digest together with the matching source commit when installing the chart or collecting paired benchmark evidence. Do not use `latest`.
+Select an existing version tag from the container registry. Tags are release aliases; pin an image digest together with the matching source commit when installing the chart or collecting paired benchmark evidence. Do not use `latest`.
 
 ## Build from source
 
@@ -59,7 +57,7 @@ python scripts/create_model_cache_manifest.py \
 
 Use the corresponding Qwen3-0.6B revision and config hash when preparing the correctness cache. The build does not create a marker or accept an unverified cache.
 
-## Release builds
+## Publish a versioned image
 
 Set `PRISM_RELEASE=true` for a published image and pass an exact lowercase 40-character source revision. Release mode rejects `local`:
 
@@ -73,4 +71,4 @@ docker build \
   -t prism-serve:<release> .
 ```
 
-Create the Git tag `v0.2.0` on the same clean source commit used for the published image.
+After verifying the source and image, create a Git tag with the same version on the clean source commit used for the image. Create a GitHub Release only for an intentional user-facing milestone.

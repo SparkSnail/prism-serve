@@ -36,16 +36,16 @@ Without `--provenance`, the output is deliberately labelled `timing-only` and mu
 
 ```bash
 PRISM_OPERATOR_TOKEN="$PRISM_OPERATOR_TOKEN" \
+PRISM_RUNTIME_IDENTITY_URL="<authenticated-runtime-identity-url>" \
 python bench/bench_endpoint.py \
   --url http://127.0.0.1:8080/v1/chat/completions \
   --model Qwen/Qwen3-8B --prompt-file prompts.jsonl \
   --provenance provenance.json \
-  --runtime-identity-url \
-    http://127.0.0.1:8080/internal/week12/performance/runtime-identity \
+  --runtime-identity-url "$PRISM_RUNTIME_IDENTITY_URL" \
   --output endpoint-result.json
 ```
 
-The operator is responsible for choosing prompts whose declared token count matches the pinned tokenizer. The runtime identity endpoint is available only when the performance harness is enabled and requires the same operator token. Install the performance overlay with immutable `gateway.image.digest` and `worker.image.digest` values plus the matching 40-character `gateway.image.sourceCommit` and `worker.image.sourceCommit`; the chart then exports full `repository@sha256:...` references to the endpoint. The client rejects an incomplete runtime identity before sending requests.
+The operator is responsible for choosing prompts whose declared token count matches the pinned tokenizer. The performance harness exposes an authenticated runtime identity endpoint and requires the same operator token. Set `PRISM_RUNTIME_IDENTITY_URL` to that endpoint. Install the performance overlay with immutable `gateway.image.digest` and `worker.image.digest` values plus the matching 40-character `gateway.image.sourceCommit` and `worker.image.sourceCommit`; the chart then exports full `repository@sha256:...` references to the endpoint. The client rejects an incomplete runtime identity before sending requests.
 
 The client rejects a different origin, endpoint path, model/revision, topology generation, source commit, source URL, or image digest before sending any benchmark request. Compare only runs with the same model, image digests, topology, prompt mix, concurrency, and warm-up policy.
 

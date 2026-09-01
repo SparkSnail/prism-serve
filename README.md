@@ -123,7 +123,7 @@ curl -N http://localhost:8080/v1/chat/completions \
 
 The stream intentionally exposes generated `token_id` values. It is a Prism runtime endpoint, not a drop-in replacement for an OpenAI text response.
 
-For a fixed 2P2D deployment, worker identity and readiness are established by the Helm topology and `scripts/pd_worldctl.py`. The legacy `/internal/register_instance` endpoint is only a single-process compatibility endpoint and is rejected when the Week 12 worker registry is active; it is not the worker bootstrap path.
+For a fixed 2P2D deployment, worker identity and readiness are established by the Helm topology and `scripts/pd_worldctl.py`. The legacy `/internal/register_instance` endpoint is only a single-process compatibility endpoint and is rejected when the active worker registry is enabled; it is not the worker bootstrap path.
 
 
 ## Testing
@@ -138,19 +138,18 @@ python -m pytest tests/ -q
 The chart is a fixed 2P2D reference deployment. It does not install NATS or create the startup permit that authorizes a worker world. Prepare those two dependencies first:
 
 1. Provide a reachable NATS service and set its URL. For example, an existing service named `nats` in the `prism` namespace is `nats://nats:4222`.
-2. Install the chart with the published image tags (or pin both images to digests):
+2. Choose a matching Gateway and worker release pair from the container registry. The chart does not build or publish images.
 
 ```bash
+GATEWAY_TAG="<gateway-release-tag>"
+WORKER_TAG="<worker-release-tag>"
+docker manifest inspect "sparksnail/prism-serve:$GATEWAY_TAG"
+docker manifest inspect "sparksnail/prism-infer:$WORKER_TAG"
 helm upgrade --install prism-serve k8s/helm/prism-serve \
   -n prism --create-namespace \
-  --set-string nats.url=nats://nats:4222
-```
-
-The default chart references the release tags `v0.2.0` (Gateway) and `v0.3.0` (worker). Verify that the tags are present in your registry before installing; the chart does not build or publish images:
-
-```bash
-docker manifest inspect sparksnail/prism-serve:v0.2.0
-docker manifest inspect sparksnail/prism-infer:v0.3.0
+  --set-string nats.url=nats://nats:4222 \
+  --set-string gateway.image.tag="$GATEWAY_TAG" \
+  --set-string worker.image.tag="$WORKER_TAG"
 ```
 
 Pin both images to their registry digests for a reproducible deployment:
@@ -180,11 +179,9 @@ python scripts/pd_worldctl.py initialize \
 
 The deployment becomes ready only after all four workers report the same generation and the controller accepts the resulting evidence. Node labels `prism.sparksnail.ai/pd-node-group=a|b`, one NVIDIA GPU per worker, and a dynamic storage class for the replacement PVC are required by the default values.
 
-The 8B benchmark profile is an explicit overlay and keeps affinity opt-in:
+The 8B benchmark profile is an explicit overlay and keeps affinity opt-in. Resolve matching `-qwen3-8b` image tags from the registry, then pin the resulting image digests:
 
 ```bash
-docker manifest inspect sparksnail/prism-serve:v0.2.0-qwen3-8b
-docker manifest inspect sparksnail/prism-infer:v0.3.0-qwen3-8b
 helm install prism-serve k8s/helm/prism-serve \
   -f k8s/helm/prism-serve/values-performance.yaml \
   --set-string nats.url=nats://nats:4222 \
