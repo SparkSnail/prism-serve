@@ -6,13 +6,21 @@ import re
 from pathlib import Path
 
 
-DOCKERFILE = Path(__file__).parents[1] / "Dockerfile"
+ROOT = Path(__file__).parents[1]
+DOCKERFILE = ROOT / "docker" / "Dockerfile"
+DOCKER_GUIDE = DOCKERFILE.parent / "README.md"
 
 
 def _stage(text: str, name: str, next_name: str) -> str:
     return text.split(f"FROM common AS {name}", 1)[1].split(
         f"FROM common AS {next_name}", 1
     )[0]
+
+
+def test_docker_definition_and_guide_have_one_dedicated_location() -> None:
+    assert DOCKERFILE.is_file()
+    assert DOCKER_GUIDE.is_file()
+    assert not (ROOT / "Dockerfile").exists()
 
 
 def test_dockerfile_has_one_closed_variant_selector() -> None:
@@ -122,7 +130,8 @@ def test_dockerfile_exposes_full_oci_provenance_and_smoke_import() -> None:
 
 def test_dockerfile_stages_tokenizer_from_local_named_context() -> None:
     text = DOCKERFILE.read_text(encoding="utf-8")
-    readme = (DOCKERFILE.parent / "README.md").read_text(encoding="utf-8")
+    guide = DOCKER_GUIDE.read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
     assert "FROM profile-${PRISM_IMAGE_VARIANT} AS model-staging" in text
     assert (
@@ -133,12 +142,14 @@ def test_dockerfile_stages_tokenizer_from_local_named_context() -> None:
     assert "snapshot_download" not in text
     assert "huggingface_hub" not in text
     assert "model-cache must be a model directory" in text
-    assert "--build-context model-cache=" in readme
-    assert "does not download model files from Hugging Face" in readme
+    assert "-f docker/Dockerfile" in guide
+    assert "--build-context model-cache=" in guide
+    assert "never downloads a model" in guide
+    assert "[Docker guide](docker/README.md)" in readme
     assert "model-cache is missing .prism-model-manifest.json" in text
     assert '"prism.local_model_cache/v1"' in text
     assert "file hash mismatch" in text
     assert "model-cache is missing .prism-model-revision" in text
     assert ".prism-model-manifest.json" in text
     assert "write_text" not in text.split("FROM profile-${PRISM_IMAGE_VARIANT} AS model-staging", 1)[1].split("PY", 1)[0]
-    assert (DOCKERFILE.parent / "scripts" / "create_model_cache_manifest.py").is_file()
+    assert (ROOT / "scripts" / "create_model_cache_manifest.py").is_file()
